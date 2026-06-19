@@ -1,0 +1,3440 @@
+
+================================================================================
+PHASE 1
+================================================================================
+
+Phase 1 — Project Setup & Basic UI
+Goal
+Establish the foundational structure of the AI SQL Assistant before any AI or database logic is added. This phase wires together a React frontend and a FastAPI backend with a basic chat interface so that all future phases have a stable, verified communication layer to build on.
+Technologies Used
+Technology
+Version / Notes
+Why It Is Used
+React
+18.x
+Component-based UI framework
+Vite
+5.x
+Fast dev server and bundler for React
+Tailwind CSS
+3.x
+Utility-first CSS for quick, clean styling
+Axios
+1.x
+Promise-based HTTP client for frontend → backend requests
+FastAPI
+0.110.x
+Modern Python web framework for building APIs
+Uvicorn
+0.29.x
+ASGI server to run the FastAPI application
+Python
+3.11+
+Backend runtime
+Node.js
+18+
+Required to run Vite and install npm packages
+Project Folder Structure
+ai-sql-assistant/
+├── frontend/                    # React + Vite application
+│   ├── public/
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── ChatWindow.jsx   # Renders the list of messages
+│   │   │   ├── MessageBubble.jsx# Individual message bubble (user / bot)
+│   │   │   └── InputBar.jsx     # Text input + Send button
+│   │   ├── services/
+│   │   │   └── api.js           # Axios instance + API call functions
+│   │   ├── App.jsx              # Root component, holds chat state
+│   │   └── main.jsx             # ReactDOM.render entry point
+│   ├── index.html
+│   ├── vite.config.js
+│   ├── tailwind.config.js
+│   └── package.json
+│
+└── backend/                     # FastAPI application
+├── main.py                  # App entry point, mounts routers
+├── routers/
+│   └── chat.py              # /api/chat route (Phase 1 stub)
+├── models/
+│   └── schemas.py           # Pydantic request/response models
+└── requirements.txt
+Files — What Each File Does
+Frontend
+src/main.jsx
+Entry point. Mounts <App /> into index.html. No logic here.
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App'
+import './index.css'
+ReactDOM.createRoot(document.getElementById('root')).render(<App />)
+src/App.jsx
+Root component. Owns the messages array in state. Passes messages to <ChatWindow> and the send handler to <InputBar>.
+State shape:
+messages: [
+{ id: 1, role: 'user',      text: 'Hello' },
+{ id: 2, role: 'assistant', text: 'Hi! How can I help?' }
+]
+loading: false
+error: null
+Responsibilities:
+Call api.sendMessage(text) when user submits
+Append the response to messages
+Manage loading and error states
+src/components/ChatWindow.jsx
+Renders the scrollable message list. Maps messages array to <MessageBubble> components. Auto-scrolls to the bottom on new messages using a useEffect + useRef.
+src/components/MessageBubble.jsx
+Renders a single chat bubble. Uses Tailwind classes to visually distinguish role: 'user' (right-aligned, blue) from role: 'assistant' (left-aligned, grey).
+src/components/InputBar.jsx
+Contains a <textarea> and a Send button. Handles:
+Enter key to submit
+Shift+Enter for new line
+Disabled state while loading is true
+src/services/api.js
+Creates a configured Axios instance pointing at http://localhost:8000. Exports:
+export async function sendMessage(text) {
+const response = await apiClient.post('/api/chat', { message: text })
+return response.data  // { reply: "..." }
+}
+vite.config.js
+Configures Vite dev server. Sets up a proxy so /api/* requests during development are forwarded to http://localhost:8000, avoiding CORS issues in dev.
+server: {
+proxy: {
+'/api': 'http://localhost:8000'
+}
+}
+tailwind.config.js
+Points Tailwind at ./src/**/*.{js,jsx} for purging unused classes. No custom theme needed in Phase 1.
+Backend
+backend/main.py
+Creates the FastAPI app, adds CORS middleware (allowing http://localhost:5173), and includes the chat router.
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from routers import chat
+app = FastAPI(title="AI SQL Assistant")
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], ...)
+app.include_router(chat.router, prefix="/api")
+backend/routers/chat.py
+Defines the single POST /api/chat endpoint. In Phase 1 it is a stub — it echoes back a hardcoded reply so frontend-backend communication can be verified.
+@router.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+return ChatResponse(reply=f"Echo: {request.message}")
+backend/models/schemas.py
+Pydantic models for request and response validation.
+class ChatRequest(BaseModel):
+message: str
+class ChatResponse(BaseModel):
+reply: str
+This model will expand in future phases (adding sql, results, etc.) without breaking the frontend contract.
+backend/requirements.txt
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.6.0
+How Files Interact
+User types message
+│
+▼
+InputBar.jsx  ──(calls)──▶  api.js  ──(POST /api/chat)──▶  FastAPI main.py
+│
+chat.py router
+│
+schemas.py validates
+│
+returns ChatResponse
+▲                                                             │
+│                                                             │
+App.jsx updates messages state  ◀──────────────────────────────────┘
+│
+▼
+ChatWindow.jsx re-renders
+│
+▼
+MessageBubble.jsx shows new message
+Communication Flow
+User types a message in InputBar and presses Send.
+App.jsx calls sendMessage(text) from api.js.
+Axios posts { message: "..." } to POST http://localhost:8000/api/chat.
+FastAPI validates the request body against ChatRequest schema.
+chat.py returns { reply: "Echo: ..." }.
+App.jsx appends the reply to the messages state array.
+ChatWindow re-renders and MessageBubble displays the new message.
+Implementation Steps
+Step 1 — Frontend Setup
+npm create vite@latest frontend -- --template react
+cd frontend
+npm install
+npm install axios
+npm install -D tailwindcss postcss autoprefixer
+npx tailwindcss init -p
+Configure tailwind.config.js content paths. Add Tailwind directives to src/index.css.
+Step 2 — Backend Setup
+mkdir backend && cd backend
+python -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install fastapi uvicorn pydantic
+Create main.py, routers/chat.py, models/schemas.py.
+Run backend:
+uvicorn main:app --reload --port 8000
+Step 3 — Frontend–Backend Connection
+Add proxy in vite.config.js
+Create src/services/api.js with Axios instance
+Run frontend:
+npm run dev   # starts at http://localhost:5173
+Step 4 — Build Chat Interface
+Build ChatWindow, MessageBubble, InputBar components
+Wire state in App.jsx
+Add loading spinner and error banner
+Error Handling Plan
+Scenario
+Handling
+Network failure (backend not running)
+Axios catch → set error state → show red error banner
+Backend returns 4xx/5xx
+Parse error message from response body → display to user
+Empty message submitted
+Disable Send button when input is blank
+Rapid double-submit
+Disable input while loading === true
+Expected Output at End of Phase 1
+npm run dev starts frontend at http://localhost:5173
+uvicorn main:app --reload starts backend at http://localhost:8000
+User can type a message and see an echo reply from the backend
+Loading state displays while waiting for response
+Error state displays if backend is unreachable
+No AI logic, no database — communication layer only
+ADDITIONAL REQUIREMENTS — DATABASE & TABLE MANAGEMENT UI
+Extend the frontend interface to support dynamic PostgreSQL database and table management.
+The UI must now support:
+Database Selection System
+Add a database dropdown selector at the top of the interface.
+Fetch all PostgreSQL databases from backend endpoint:GET /api/databases
+Show all existing databases in dropdown.
+Include:
+Create New Database
+option inside dropdown.
+Create Database ModalWhen user clicks:
+Create New Database
+open a modal popup containing:
+database name input
+create button
+cancel button
+On submit:call:POST /api/create-database
+Body:{"database_name": "hr_database"}
+After successful creation:
+automatically refresh database dropdown
+automatically select newly created database
+clear modal state
+Table Selection SystemAfter database selection:
+fetch tables dynamically from:GET /api/tables/{database_name}
+Display tables in second dropdown:Tables ▼
+Include:
+Create New Table
+Create Table ModalAllow users to dynamically create PostgreSQL tables.
+Modal requirements:
+table name input
+dynamically add/remove columns
+each column must contain:
+column name
+PostgreSQL type dropdown
+Allowed PostgreSQL types:
+TEXT
+INTEGER
+BOOLEAN
+DATE
+FLOAT
+TIMESTAMP
+Example request:
+{"database": "hr_database","table_name": "interns","columns": [{"name":"name","type":"TEXT"},{"name":"college","type":"TEXT"},{"name":"stipend","type":"INTEGER"}]}
+Global React StateAdd application-level state management for:
+selectedDatabase
+selectedTable
+databases
+tables
+Application Flow
+Database Selector↓Table Selector↓Chat Interface↓Results Panel
+UX Requirements
+automatically refresh tables when database changes
+automatically refresh schemas after creation
+loading indicators for DB/table creation
+success/error toast notifications
+disable invalid submissions
+validate empty names
+Technology Requirements
+React 18
+Tailwind CSS
+Axios
+Functional components only
+React hooks only
+
+
+================================================================================
+PHASE 2
+================================================================================
+
+Phase 2 — PostgreSQL Connection & Schema System
+Goal
+Connect the FastAPI backend to a live PostgreSQL server, dynamically discover all available databases, and extract table/column metadata from any selected database. The extracted schema will be stored in backend memory so it is ready to be injected into AI prompts in Phase 3.
+Technologies Used
+Technology
+Version / Notes
+Why It Is Used
+PostgreSQL
+15.x
+Primary relational database system
+psycopg2-binary
+2.9.x
+Python driver for connecting to PostgreSQL
+FastAPI
+0.110.x
+Backend framework (continued from Phase 1)
+Python dotenv (python-dotenv)
+1.0.x
+Load DB credentials from .env file
+information_schema
+Built into PostgreSQL
+Standard schema for discovering tables and columns
+Pydantic
+2.6.x
+Validates API responses and config models
+Project Folder Structure (additions to Phase 1)
+backend/
+├── main.py                        # (unchanged from Phase 1)
+├── routers/
+│   ├── chat.py                    # (Phase 1 stub, will expand in Phase 3)
+│   └── schema.py                  # NEW — /api/databases, /api/schema routes
+├── models/
+│   └── schemas.py                 # UPDATED — adds DB list and schema response models
+├── db/
+│   ├── __init__.py
+│   ├── connection.py              # NEW — creates psycopg2 connections
+│   └── schema_fetcher.py         # NEW — queries information_schema
+├── state/
+│   └── metadata_store.py         # NEW — in-memory dict holding fetched schema
+├── .env                           # NEW — DB credentials (never committed to git)
+└── requirements.txt               # UPDATED
+Files — What Each File Does
+backend/.env
+Holds database connection credentials. Loaded by python-dotenv at startup. Never committed to version control.
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=sqlassistant
+DB_PASSWORD=CSUsql123
+DB_SUPERDB=hr_database          # The admin DB used to list all databases
+backend/db/connection.py
+Provides a single function get_connection(dbname) that returns a live psycopg2 connection. Uses credentials from .env. Handles connection errors and raises a clean HTTP 500 if the database is unreachable.
+import psycopg2
+from dotenv import load_dotenv
+import os
+load_dotenv()
+def get_connection(dbname: str):
+return psycopg2.connect(
+host=os.getenv("DB_HOST"),
+port=os.getenv("DB_PORT"),
+user=os.getenv("DB_USER"),
+password=os.getenv("DB_PASSWORD"),
+dbname=dbname
+)
+All routes that need a DB connection call this function. Connections are opened per-request and closed in a finally block to avoid connection leaks.
+backend/db/schema_fetcher.py
+Contains two core functions:
+fetch_all_databases() Connects to the postgres admin DB and queries pg_database to return a list of user-created database names (excluding system DBs like template0, template1, postgres).
+SELECT datname FROM pg_database
+WHERE datistemplate = false AND datname NOT IN ('postgres')
+ORDER BY datname;
+fetch_schema(dbname: str) -> dict Connects to the specified database and queries information_schema.columns to build a dictionary of the form:
+{
+"employees": ["id", "name", "salary", "department_id"],
+"departments": ["id", "name", "location"]
+}
+SQL used:
+SELECT table_name, column_name
+FROM information_schema.columns
+WHERE table_schema = 'public'
+ORDER BY table_name, ordinal_position;
+backend/state/metadata_store.py
+A simple in-memory Python module-level dictionary acting as a lightweight cache.
+_store = {
+"databases": [],          # List[str] of available DB names
+"selected_db": None,      # str — currently selected database name
+"schema": {}              # Dict[str, List[str]] — table -> columns
+}
+def get_metadata(): ...
+def set_databases(dbs: list): ...
+def set_selected_db(name: str): ...
+def set_schema(schema: dict): ...
+def clear(): ...
+This store is module-level so it persists across requests within a single server process. It resets on server restart. Phase 6 (Memory System) will extend this pattern for conversation history.
+backend/routers/schema.py
+Exposes three endpoints:
+GET /api/databases Calls fetch_all_databases(), stores result in metadata_store, and returns the list.
+@router.get("/databases")
+async def list_databases():
+dbs = fetch_all_databases()
+set_databases(dbs)
+return {"databases": dbs}
+POST /api/select-database Accepts { "database": "hr_db" }, fetches its schema, stores both in metadata_store.
+@router.post("/select-database")
+async def select_database(request: SelectDBRequest):
+schema = fetch_schema(request.database)
+set_selected_db(request.database)
+set_schema(schema)
+return {"selected": request.database, "schema": schema}
+GET /api/schema Returns the currently cached schema from metadata_store without hitting the DB again.
+backend/models/schemas.py (updated)
+Adds new Pydantic models alongside Phase 1 models:
+class SelectDBRequest(BaseModel):
+database: str
+class SchemaResponse(BaseModel):
+selected: str
+schema: dict[str, list[str]]
+backend/requirements.txt (updated)
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.6.0
+psycopg2-binary==2.9.9
+python-dotenv==1.0.0
+Frontend Changes (Optional in Phase 2)
+A minimal DB selector can be added to the UI:
+On app load, call GET /api/databases to populate a dropdown.
+When user selects a database, call POST /api/select-database.
+Show the selected DB name in the header.
+This is optional but useful for testing Phase 2 in isolation before Phase 3.
+How Files Interact
+App startup
+│
+▼
+GET /api/databases
+│
+schema.py router
+│
+schema_fetcher.fetch_all_databases()
+│
+connection.get_connection("postgres")
+│
+pg_database query
+│
+Returns ["hr_db", "inventory_db", ...]
+│
+metadata_store.set_databases(dbs)
+│
+Response to frontend dropdown
+User selects "hr_db"
+│
+▼
+POST /api/select-database  { database: "hr_db" }
+│
+schema_fetcher.fetch_schema("hr_db")
+│
+information_schema.columns query
+│
+Returns { "employees": ["id","name","salary"], ... }
+│
+metadata_store.set_selected_db("hr_db")
+metadata_store.set_schema({...})
+│
+Response + schema cached in memory
+│
+▼ (Phase 3 will read from metadata_store directly)
+PostgreSQL Sample Setup
+Create sample databases and tables for development and testing:
+-- Run in psql as superuser
+CREATE DATABASE hr_db;
+\c hr_db
+CREATE TABLE departments (
+id SERIAL PRIMARY KEY,
+name VARCHAR(100),
+location VARCHAR(100)
+);
+CREATE TABLE employees (
+id SERIAL PRIMARY KEY,
+name VARCHAR(100),
+salary NUMERIC,
+department_id INT REFERENCES departments(id),
+hire_date DATE
+);
+-- Create second database for multi-DB testing (used properly in Phase 7)
+CREATE DATABASE inventory_db;
+\c inventory_db
+CREATE TABLE products (
+id SERIAL PRIMARY KEY,
+name VARCHAR(100),
+stock INT,
+category VARCHAR(50),
+price NUMERIC
+);
+Schema Metadata Format
+The schema stored in metadata_store and passed to the AI (Phase 3) will be formatted as a string like:
+Table: employees
+Columns: id, name, salary, department_id, hire_date
+Table: departments
+Columns: id, name, location
+The schema_fetcher.py module includes a format_schema_for_prompt(schema: dict) -> str helper that produces this string from the raw dict.
+Implementation Steps
+Step 1 — PostgreSQL Setup
+Install PostgreSQL locally
+Create hr_db and inventory_db with sample tables and seed data
+Verify connectivity: psql -U postgres -d hr_db
+Step 2 — Backend DB Connection
+pip install psycopg2-binary python-dotenv
+Create .env file with credentials
+Write db/connection.py and test it with a quick script
+Step 3 — Database Discovery
+Write fetch_all_databases() in schema_fetcher.py
+Add GET /api/databases route
+Test with curl: curl http://localhost:8000/api/databases
+Step 4 — Schema Fetching
+Write fetch_schema(dbname) in schema_fetcher.py
+Test it returns correct tables and columns for hr_db
+Step 5 — Metadata Store & API
+Create state/metadata_store.py
+Add POST /api/select-database and GET /api/schema routes
+Verify metadata is stored and readable
+Error Handling Plan
+Scenario
+Handling
+DB credentials wrong
+psycopg2 raises OperationalError → caught → 500 response with message
+Database name not found
+psycopg2 raises error → caught → 404 response
+Empty schema (no public tables)
+Returns empty dict {} → frontend shows "No tables found"
+.env missing
+python-dotenv returns None → explicit check at startup raises RuntimeError
+Connection timeout
+psycopg2 connect_timeout param set to 5s → caught → 503 response
+Expected Output at End of Phase 2
+GET /api/databases returns list of available PostgreSQL databases
+POST /api/select-database with { "database": "hr_db" } returns full schema
+GET /api/schema returns cached schema without re-querying the DB
+Schema data is stored in metadata_store and ready for Phase 3 AI injection
+All connection errors are handled gracefully with meaningful API responses
+What Is NOT in This Phase
+AI / Gemini integration (Phase 3)
+SQL generation or execution
+SQL validation
+Session memory / conversation context
+ADDITIONAL REQUIREMENTS — POSTGRESQL DATABASE & TABLE MANAGEMENT LAYER
+Extend the backend architecture to support dynamic PostgreSQL management.
+The backend must now support:
+database discovery
+database creation
+table discovery
+dynamic table creation
+schema refresh
+metadata synchronization
+Create New Backend Files
+backend/db/database_manager.pyResponsibilities:
+fetch all PostgreSQL databases
+create PostgreSQL databases dynamically
+validate database names
+refresh metadata cache
+backend/db/table_manager.pyResponsibilities:
+fetch tables from selected database
+create PostgreSQL tables dynamically
+validate column names/types
+generate CREATE TABLE SQL safely
+Create Database Discovery Function
+Use PostgreSQL query:
+SELECT datnameFROM pg_databaseWHERE datistemplate = false;
+Return:
+all user-created databases
+exclude PostgreSQL template databases
+Dynamic Database Creation
+Support dynamic PostgreSQL database creation.
+Example SQL:CREATE DATABASE hr_database;
+IMPORTANT:Before CREATE DATABASE:enable:conn.autocommit = True
+Requirements:
+validate DB names
+allow only:lettersnumbersunderscores
+prevent SQL injection
+Table Discovery
+Fetch all tables of selected database.
+Use:
+SELECT table_nameFROM information_schema.tablesWHERE table_schema='public';
+Dynamic Table Creation
+Generate CREATE TABLE queries dynamically.
+Example:
+CREATE TABLE interns (id SERIAL PRIMARY KEY,name TEXT,college TEXT,stipend INTEGER);
+Requirements:
+automatically add:id SERIAL PRIMARY KEY
+validate all column names
+validate PostgreSQL types
+reject invalid SQL
+Allowed PostgreSQL Column Types
+Allowed:
+TEXT
+INTEGER
+BOOLEAN
+DATE
+FLOAT
+TIMESTAMP
+Reject all others.
+Add FastAPI Endpoints
+GET /api/databases
+return all databases
+POST /api/create-database
+create new DB dynamically
+GET /api/tables/{database_name}
+return all tables
+POST /api/create-table
+dynamically create tables
+Metadata Store Updates
+Extend metadata store to maintain:
+databases list
+selected database
+tables list
+schema cache
+table schemas
+Automatic Metadata Refresh
+Whenever:
+database created
+table created
+automatically refresh:
+schemas
+tables
+routing summaries
+Technology Requirements
+FastAPI
+PostgreSQL
+psycopg2
+information_schema
+modular architecture
+
+
+================================================================================
+PHASE 3
+================================================================================
+
+Phase 3 — AI SQL Generation System
+Goal
+Integrate the Gemini AI model to convert natural language user questions into valid PostgreSQL queries. The database schema fetched in Phase 2 is injected into the prompt so that Gemini only generates SQL using real tables and columns, preventing hallucination.
+Technologies Used
+Technology
+Version / Notes
+Why It Is Used
+Gemini API (Google Generative AI)
+gemini-1.5-flash or gemini-1.5-pro
+LLM that converts English instructions into SQL
+google-generativeai (Python SDK)
+0.5.x
+Official Python client for Gemini API
+FastAPI
+0.110.x
+Backend framework (continued)
+Prompt Engineering
+Custom templates
+Controls Gemini output format and reduces hallucination
+PostgreSQL Schema Metadata
+From Phase 2 metadata_store
+Tells Gemini which tables/columns exist
+python-dotenv
+1.0.x
+Loads GEMINI_API_KEY from .env
+Project Folder Structure (additions to Phase 2)
+backend/
+├── main.py
+├── routers/
+│   ├── chat.py                    # UPDATED — now calls AI layer
+│   └── schema.py                  # (unchanged)
+├── models/
+│   └── schemas.py                 # UPDATED — adds AI request/response models
+├── db/
+│   ├── connection.py
+│   └── schema_fetcher.py
+├── state/
+│   └── metadata_store.py          # (unchanged)
+├── ai/
+│   ├── __init__.py
+│   ├── gemini_client.py           # NEW — initialises Gemini SDK, exposes generate()
+│   ├── prompt_builder.py          # NEW — assembles the full prompt string
+│   └── sql_extractor.py           # NEW — cleans raw Gemini response → pure SQL
+├── .env                           # UPDATED — add GEMINI_API_KEY
+└── requirements.txt               # UPDATED
+Files — What Each File Does
+backend/.env (updated)
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=sqlassistant
+DB_PASSWORD=CSUsql123
+DB_SUPERDB=hr_database
+GEMINI_API_KEY=AIza...yourkey...
+backend/ai/gemini_client.py
+Initialises the Gemini SDK once at module load time. Exposes a single async-friendly function generate_sql(prompt: str) -> str that sends the prompt to Gemini and returns the raw text response.
+import google.generativeai as genai
+import os
+from dotenv import load_dotenv
+load_dotenv()
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-1.5-flash")
+def generate_sql(prompt: str) -> str:
+response = model.generate_content(prompt)
+return response.text
+Using a module-level model instance avoids re-initialising the SDK on every request.
+backend/ai/prompt_builder.py
+Assembles the final prompt string from three components:
+System instructions — strict rules telling Gemini to return only SQL
+Schema block — formatted table/column list from metadata_store
+User question — the natural language input
+SYSTEM_INSTRUCTIONS = """
+You are a PostgreSQL expert. Your only job is to convert the user's question into a valid SQL query.
+Rules:
+- Return ONLY the SQL query. No explanations. No markdown. No backticks.
+- Use ONLY the tables and columns listed in the schema below.
+- Do NOT invent tables or columns that are not in the schema.
+- End every query with a semicolon.
+- If the question cannot be answered with the given schema, return exactly: CANNOT_GENERATE
+"""
+def build_prompt(schema_str: str, user_question: str) -> str:
+return f"""{SYSTEM_INSTRUCTIONS}
+DATABASE SCHEMA:
+{schema_str}
+USER QUESTION:
+{user_question}
+SQL QUERY:"""
+The schema_str is produced by schema_fetcher.format_schema_for_prompt() from Phase 2.
+Example assembled prompt sent to Gemini:
+You are a PostgreSQL expert. Your only job is to convert the user's question...
+DATABASE SCHEMA:
+Table: employees
+Columns: id, name, salary, department_id, hire_date
+Table: departments
+Columns: id, name, location
+USER QUESTION:
+Show all employees with salary above 50000
+SQL QUERY:
+backend/ai/sql_extractor.py
+Even with strict prompting, Gemini occasionally wraps output in markdown fences (```sql ... ```) or adds a short explanation. This module cleans the response.
+import re
+def extract_sql(raw_response: str) -> str | None:
+# Remove markdown code fences
+cleaned = re.sub(r"```(?:sql)?", "", raw_response, flags=re.IGNORECASE).strip()
+cleaned = cleaned.replace("```", "").strip()
+if cleaned.upper() == "CANNOT_GENERATE":
+return None
+# Keep only the first statement if multiple are returned
+if ";" in cleaned:
+cleaned = cleaned.split(";")[0].strip() + ";"
+return cleaned if cleaned else None
+Returns None when Gemini signals it cannot generate SQL for the given question.
+backend/routers/chat.py (updated)
+The main chat endpoint now invokes the AI pipeline:
+@router.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+# Get cached schema from Phase 2
+schema = get_metadata()["schema"]
+schema_str = format_schema_for_prompt(schema)
+# Build prompt and call Gemini
+prompt = build_prompt(schema_str, request.message)
+raw = generate_sql(prompt)
+sql = extract_sql(raw)
+if sql is None:
+return ChatResponse(
+reply="I could not generate a SQL query for that question.",
+sql=None
+)
+return ChatResponse(reply="SQL generated successfully.", sql=sql)
+At this stage the SQL is returned to the frontend but NOT executed yet (execution is Phase 5).
+backend/models/schemas.py (updated)
+class ChatRequest(BaseModel):
+message: str
+class ChatResponse(BaseModel):
+reply: str
+sql: str | None = None        # NEW — generated SQL query
+backend/requirements.txt (updated)
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.6.0
+psycopg2-binary==2.9.9
+python-dotenv==1.0.0
+google-generativeai==0.5.4
+How Files Interact
+User types: "Show employees with salary above 50000"
+│
+▼
+POST /api/chat  { message: "Show employees..." }
+│
+chat.py router
+│
+metadata_store.get_metadata()["schema"]          ← from Phase 2
+│
+schema_fetcher.format_schema_for_prompt(schema)
+│
+prompt_builder.build_prompt(schema_str, message)
+│
+gemini_client.generate_sql(prompt)
+│
+Gemini API (external)
+│
+Returns raw text: "SELECT * FROM employees WHERE salary > 50000;"
+│
+sql_extractor.extract_sql(raw)
+│
+Returns clean SQL string
+│
+ChatResponse(reply="SQL generated.", sql="SELECT * FROM employees WHERE salary > 50000;")
+│
+▼
+Frontend displays generated SQL in chat window
+Prompt Engineering Strategy
+Why Strict Prompting Matters
+Without instructions, Gemini may:
+Return markdown code fences
+Add English explanations before the SQL
+Invent table names not in the schema
+Generate multiple alternative queries
+Techniques Used
+Technique
+How It Is Applied
+Role assignment
+"You are a PostgreSQL expert" sets the model's persona
+Output format constraint
+"Return ONLY the SQL query. No explanations. No markdown."
+Schema injection
+Full table/column list given in every prompt
+Explicit fallback signal
+"Return exactly: CANNOT_GENERATE" for unanswerable questions
+Semicolon enforcement
+"End every query with a semicolon"
+Schema isolation
+"Use ONLY the tables and columns listed" prevents hallucination
+Example Prompts and Expected Outputs
+Input: "Show all employees" Expected SQL: SELECT * FROM employees;
+Input: "How many employees are in each department?" Expected SQL:
+SELECT d.name, COUNT(e.id) AS employee_count
+FROM employees e
+JOIN departments d ON e.department_id = d.id
+GROUP BY d.name;
+Input: "What is the weather today?" Expected: CANNOT_GENERATE → returns friendly error message
+Hallucination Prevention
+Risk
+Prevention
+AI invents non-existent table
+Schema injection limits available tables
+AI invents column names
+Schema injection lists exact column names
+AI generates multiple queries
+sql_extractor keeps only the first statement
+AI returns prose instead of SQL
+Phase 4 validation will catch non-SQL responses
+AI generates DROP/DELETE
+Phase 4 validation blocks dangerous operations
+Frontend Changes
+ChatWindow.jsx / MessageBubble.jsx should be updated to:
+Display the generated SQL in a styled code block (monospace font, grey background)
+Show a "Copy SQL" button next to the code block
+Keep the chat reply text above the code block
+{message.sql && (
+<pre className="bg-gray-100 p-2 rounded text-sm font-mono mt-2">
+{message.sql}
+</pre>
+)}
+Implementation Steps
+Step 1 — Gemini API Setup
+Get API key from Google AI Studio (aistudio.google.com)
+Add GEMINI_API_KEY to .env
+Install SDK: pip install google-generativeai
+Test with a simple script:
+import google.generativeai as genai
+genai.configure(api_key="YOUR_KEY")
+model = genai.GenerativeModel("gemini-1.5-flash")
+print(model.generate_content("Say hello").text)
+Step 2 — Prompt Template Creation
+Write prompt_builder.py with system instructions and schema injection
+Test prompt assembly manually before connecting to Gemini
+Step 3 — Schema Injection
+Ensure Phase 2 schema is stored in metadata_store before any chat request
+Add guard in chat.py: if no schema loaded, return "Please select a database first"
+Step 4 — SQL Generation Logic
+Wire chat.py to call build_prompt → generate_sql → extract_sql
+Test end-to-end with Postman or frontend
+Step 5 — Response Cleaning
+Test sql_extractor.py against various Gemini outputs including markdown-wrapped responses
+Add logging of raw Gemini responses for debugging
+Error Handling Plan
+Scenario
+Handling
+Gemini API key invalid
+SDK raises google.api_core.exceptions.PermissionDenied → caught → 401
+Gemini rate limit hit
+SDK raises ResourceExhausted → caught → 429 with retry message
+Gemini returns CANNOT_GENERATE
+extract_sql returns None → user sees "I could not generate SQL"
+No database selected (no schema)
+Guard in chat.py → returns "Please select a database first"
+Gemini timeout
+Set request_options={"timeout": 30} → caught → 504
+Expected Output at End of Phase 3
+User types "Show all employees" → backend returns SELECT * FROM employees;
+User types "Employees with salary above 50000" → correct WHERE salary > 50000 query
+User asks unrelated question → "I could not generate SQL" message
+Generated SQL is visible in the chat interface
+SQL is NOT executed yet (that is Phase 5)
+What Is NOT in This Phase
+SQL validation or safety checks (Phase 4)
+SQL execution on PostgreSQL (Phase 5)
+Conversation memory / follow-up questions (Phase 6)
+Multi-database routing (Phase 7)
+ADDITIONAL REQUIREMENTS — AI DATABASE MANAGEMENT CAPABILITIES
+Extend the AI SQL generation layer into a PostgreSQL management assistant.
+The AI must now support:
+CREATE DATABASE
+CREATE TABLE
+SELECT
+INSERT
+UPDATE
+DELETE
+Update System Prompt
+Replace SQL-only assistant with PostgreSQL management assistant.
+New system prompt:
+"You are an advanced PostgreSQL management assistant.
+You can:
+create databases
+create tables
+insert data
+query data
+update data
+delete data
+Rules:
+Return ONLY PostgreSQL SQL
+Never explain queries
+Never use markdown
+Use valid PostgreSQL syntax only
+Use schema metadata provided
+Avoid hallucinating tables or columns"
+Add Few-Shot Examples
+Example 1:
+User:Create HR database
+SQL:CREATE DATABASE hr_database;
+Example 2:
+User:Create interns table with name, college and stipend
+SQL:CREATE TABLE interns (id SERIAL PRIMARY KEY,name TEXT,college TEXT,stipend INTEGER);
+Example 3:
+User:Show all interns
+SQL:SELECT * FROM interns;
+Schema Awareness
+The AI must receive:
+current selected database
+available tables
+column metadata
+inside prompt context.
+AI Safety
+The AI must NOT generate:
+DROP DATABASE
+DROP TABLE
+TRUNCATE
+ALTER SYSTEM
+Dynamic Database Context
+Ensure AI understands:
+currently selected database
+currently selected table
+during SQL generation.
+
+
+================================================================================
+PHASE 4
+================================================================================
+
+Phase 4 — SQL Validation & Security System
+Goal
+Before any AI-generated SQL touches the database, it must pass through a validation layer. This phase builds that layer: detecting dangerous operations, verifying that referenced tables and columns actually exist in the schema, and introducing a confirmation flow for destructive queries.
+Technologies Used
+Technology
+Version / Notes
+Why It Is Used
+sqlparse
+0.5.x
+Parses raw SQL strings into structured tokens for analysis
+Python Validation Logic
+Custom
+Rule-based checks for safety and schema accuracy
+FastAPI
+0.110.x
+Backend framework (continued)
+PostgreSQL Schema Metadata
+From Phase 2 metadata_store
+Ground truth for table/column existence checks
+Pydantic
+2.6.x
+Models for validation result responses
+Project Folder Structure (additions to Phase 3)
+backend/
+├── main.py
+├── routers/
+│   ├── chat.py                    # UPDATED — calls validator before returning SQL
+│   └── schema.py
+├── models/
+│   └── schemas.py                 # UPDATED — adds ValidationResult model
+├── db/
+│   ├── connection.py
+│   └── schema_fetcher.py
+├── state/
+│   └── metadata_store.py
+├── ai/
+│   ├── gemini_client.py
+│   ├── prompt_builder.py
+│   └── sql_extractor.py
+├── validation/
+│   ├── __init__.py
+│   ├── sql_validator.py           # NEW — main validation orchestrator
+│   ├── safety_checker.py          # NEW — detects dangerous operations
+│   └── schema_checker.py         # NEW — verifies tables and columns exist
+└── requirements.txt               # UPDATED
+Files — What Each File Does
+backend/validation/safety_checker.py
+Parses the SQL statement and checks for dangerous or disallowed operations. Returns a SafetyResult with is_safe: bool, risk_level: str, and reason: str.
+Risk Levels:
+Level
+Examples
+Action
+BLOCKED
+DROP TABLE, TRUNCATE, ALTER TABLE, raw DELETE without WHERE
+Reject immediately, never execute
+HIGH_RISK
+DELETE FROM t WHERE ..., UPDATE ... SET ...
+Require explicit user confirmation
+SAFE
+SELECT, INSERT
+Proceed to schema check
+import sqlparse
+from sqlparse.sql import Statement
+from sqlparse.tokens import Keyword, DDL, DML
+BLOCKED_KEYWORDS = {"DROP", "TRUNCATE", "ALTER", "CREATE", "GRANT", "REVOKE"}
+HIGH_RISK_OPERATIONS = {"DELETE", "UPDATE"}
+def check_safety(sql: str) -> SafetyResult:
+parsed = sqlparse.parse(sql)[0]
+statement_type = parsed.get_type()   # SELECT, INSERT, UPDATE, DELETE, etc.
+# Check for DDL (DROP, CREATE, ALTER, etc.)
+for token in parsed.flatten():
+if token.ttype in (DDL,) and token.value.upper() in BLOCKED_KEYWORDS:
+return SafetyResult(
+is_safe=False,
+risk_level="BLOCKED",
+reason=f"Operation '{token.value.upper()}' is not allowed."
+)
+# DELETE without WHERE is blocked
+if statement_type == "DELETE":
+sql_upper = sql.upper()
+if "WHERE" not in sql_upper:
+return SafetyResult(
+is_safe=False,
+risk_level="BLOCKED",
+reason="DELETE without a WHERE clause is not allowed."
+)
+return SafetyResult(is_safe=True, risk_level="HIGH_RISK", reason="DELETE requires confirmation.")
+if statement_type == "UPDATE":
+return SafetyResult(is_safe=True, risk_level="HIGH_RISK", reason="UPDATE requires confirmation.")
+return SafetyResult(is_safe=True, risk_level="SAFE", reason="Query is safe.")
+backend/validation/schema_checker.py
+Extracts table names and column names referenced in the SQL and cross-checks them against the schema stored in metadata_store.
+import re
+def check_schema(sql: str, schema: dict) -> SchemaCheckResult:
+available_tables = {t.lower() for t in schema.keys()}
+available_columns = {c.lower() for cols in schema.values() for c in cols}
+# Extract table names from FROM and JOIN clauses
+referenced_tables = extract_table_names(sql)
+# Extract column names from SELECT, WHERE, ORDER BY
+referenced_columns = extract_column_names(sql)
+invalid_tables = [t for t in referenced_tables if t not in available_tables]
+invalid_columns = [c for c in referenced_columns if c not in available_columns and c != "*"]
+if invalid_tables:
+return SchemaCheckResult(
+is_valid=False,
+reason=f"Tables not found in schema: {', '.join(invalid_tables)}"
+)
+if invalid_columns:
+return SchemaCheckResult(
+is_valid=False,
+reason=f"Columns not found in schema: {', '.join(invalid_columns)}"
+)
+return SchemaCheckResult(is_valid=True, reason="Schema check passed.")
+extract_table_names uses regex patterns to find identifiers after FROM, JOIN, INTO, UPDATE. Column extraction is best-effort; * wildcards are always allowed.
+backend/validation/sql_validator.py
+Orchestrates both checks. Returns a unified ValidationResult.
+from .safety_checker import check_safety
+from .schema_checker import check_schema
+from state.metadata_store import get_metadata
+class ValidationResult:
+passed: bool
+requires_confirmation: bool
+error_message: str | None
+risk_level: str   # SAFE | HIGH_RISK | BLOCKED
+def validate_sql(sql: str) -> ValidationResult:
+# Step 1: Safety check
+safety = check_safety(sql)
+if safety.risk_level == "BLOCKED":
+return ValidationResult(
+passed=False,
+requires_confirmation=False,
+error_message=safety.reason,
+risk_level="BLOCKED"
+)
+# Step 2: Schema check
+schema = get_metadata()["schema"]
+schema_result = check_schema(sql, schema)
+if not schema_result.is_valid:
+return ValidationResult(
+passed=False,
+requires_confirmation=False,
+error_message=schema_result.reason,
+risk_level="BLOCKED"
+)
+# Step 3: High-risk but schema-valid → needs confirmation
+if safety.risk_level == "HIGH_RISK":
+return ValidationResult(
+passed=True,
+requires_confirmation=True,
+error_message=None,
+risk_level="HIGH_RISK"
+)
+return ValidationResult(passed=True, requires_confirmation=False, error_message=None, risk_level="SAFE")
+backend/routers/chat.py (updated)
+The chat endpoint now runs validation between SQL generation and execution. In Phase 4 (execution not yet implemented), the endpoint returns the validation result alongside the SQL.
+@router.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+# Phase 3: Generate SQL
+sql = generate_and_extract_sql(request.message)
+if sql is None:
+return ChatResponse(reply="Could not generate SQL.", sql=None)
+# Phase 4: Validate SQL
+validation = validate_sql(sql)
+if not validation.passed:
+return ChatResponse(
+reply=f"Query blocked: {validation.error_message}",
+sql=sql,
+validation_error=validation.error_message
+)
+if validation.requires_confirmation:
+return ChatResponse(
+reply="This operation modifies data. Please confirm to proceed.",
+sql=sql,
+requires_confirmation=True,
+risk_level=validation.risk_level
+)
+# Phase 5 will execute here
+return ChatResponse(reply="SQL validated. Ready to execute.", sql=sql)
+backend/models/schemas.py (updated)
+class ChatResponse(BaseModel):
+reply: str
+sql: str | None = None
+validation_error: str | None = None
+requires_confirmation: bool = False
+risk_level: str | None = None   # SAFE | HIGH_RISK | BLOCKED
+backend/requirements.txt (updated)
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.6.0
+psycopg2-binary==2.9.9
+python-dotenv==1.0.0
+google-generativeai==0.5.4
+sqlparse==0.5.0
+How Files Interact
+Phase 3 generates SQL: "DELETE FROM employees WHERE id = 5;"
+│
+▼
+validation/sql_validator.validate_sql(sql)
+│
+┌───┴───────────────────────────────────┐
+▼                                       ▼
+safety_checker.check_safety(sql)    schema_checker.check_schema(sql, schema)
+│                                   │
+Statement type = DELETE             Tables referenced = ["employees"]
+WHERE clause present → HIGH_RISK    "employees" exists in schema → VALID
+│                                   │
+┌───┴───────────────────────────────────┘
+▼
+ValidationResult(
+passed=True,
+requires_confirmation=True,
+risk_level="HIGH_RISK"
+)
+│
+▼
+chat.py returns:
+reply = "This operation modifies data. Please confirm to proceed."
+sql = "DELETE FROM employees WHERE id = 5;"
+requires_confirmation = True
+│
+▼
+Frontend shows confirmation modal
+│
+User clicks "Confirm"
+│
+POST /api/chat/confirm  { sql: "DELETE ..." }   ← added in Phase 5
+Confirmation Flow (Frontend)
+When requires_confirmation: true is returned:
+Frontend shows a modal or inline warning:
+⚠️ This operation will modify data. Are you sure you want to continue? Query: DELETE FROM employees WHERE id = 5; [Cancel] [Confirm]
+If user clicks Confirm, frontend re-sends the same SQL to a new endpoint POST /api/execute-confirmed with { sql: "...", confirmed: true }.
+That endpoint is implemented in Phase 5.
+// In App.jsx state
+const [pendingConfirmation, setPendingConfirmation] = useState(null)
+// When response has requires_confirmation
+if (data.requires_confirmation) {
+setPendingConfirmation({ sql: data.sql, reply: data.reply })
+}
+// ConfirmationModal.jsx
+{pendingConfirmation && (
+<div className="modal">
+<p>⚠️ {pendingConfirmation.reply}</p>
+<pre>{pendingConfirmation.sql}</pre>
+<button onClick={onCancel}>Cancel</button>
+<button onClick={() => onConfirm(pendingConfirmation.sql)}>Confirm</button>
+</div>
+)}
+Validation Rules Summary
+Check
+Condition
+Result
+DDL operations
+DROP, TRUNCATE, ALTER, CREATE
+BLOCKED
+DELETE without WHERE
+No WHERE clause
+BLOCKED
+DELETE with WHERE
+Has WHERE condition
+HIGH_RISK (confirm)
+UPDATE
+Any UPDATE
+HIGH_RISK (confirm)
+Table not in schema
+Referenced table not found
+BLOCKED
+Column not in schema
+Referenced column not found
+BLOCKED
+SELECT
+No dangerous conditions
+SAFE
+INSERT
+Valid table
+SAFE (or HIGH_RISK if sensitive)
+Implementation Steps
+Step 1 — Install sqlparse
+pip install sqlparse
+Step 2 — Safety Checker
+Build safety_checker.py
+Unit test against: DROP TABLE, DELETE FROM x, DELETE FROM x WHERE id=1, UPDATE, SELECT
+Step 3 — Schema Checker
+Build schema_checker.py
+Test with valid tables, invalid tables, SELECT *
+Step 4 — Orchestrator
+Build sql_validator.py combining both checks
+Wire into chat.py
+Step 5 — Confirmation Flow
+Update ChatResponse model
+Build ConfirmationModal.jsx in frontend
+Error Handling Plan
+Scenario
+Handling
+sqlparse fails to parse
+Returns BLOCKED with "Could not parse SQL"
+Schema not loaded yet
+Returns BLOCKED with "No schema loaded, select a database first"
+Gemini generates multiple statements
+sql_extractor (Phase 3) already isolates the first statement
+Column name is an alias
+Alias not checked (too complex without full SQL analysis — acceptable)
+Expected Output at End of Phase 4
+DROP TABLE employees; → blocked with clear error message
+DELETE FROM employees; → blocked (no WHERE)
+DELETE FROM employees WHERE id = 5; → returns confirmation prompt
+SELECT * FROM nonexistent_table; → blocked with "table not in schema"
+SELECT * FROM employees; → passes validation, ready for execution (Phase 5)
+What Is NOT in This Phase
+Actual SQL execution (Phase 5)
+Conversation memory (Phase 6)
+Multi-database routing (Phase 7)
+ADDITIONAL REQUIREMENTS — DATABASE/TABLE SECURITY VALIDATION
+Update SQL safety validation system.
+Allowed Operations
+SAFE:
+CREATE DATABASE
+CREATE TABLE
+SELECT
+INSERT
+HIGH RISK:
+UPDATE
+DELETE
+BLOCKED:
+DROP DATABASE
+DROP TABLE
+TRUNCATE
+ALTER SYSTEM
+ALTER ROLE
+COPY TO FILE
+Add DDL Validation Layer
+Validate:
+database names
+table names
+column names
+column types
+Allowed naming rules:
+letters
+numbers
+underscores only
+Reject:
+spaces
+semicolons
+SQL keywords
+SQL comments
+SQL Injection Prevention
+Prevent:
+stacked queries
+semicolon injection
+comment injection
+malicious identifiers
+Allowed PostgreSQL Types
+Only allow:
+TEXT
+INTEGER
+BOOLEAN
+DATE
+FLOAT
+TIMESTAMP
+Reject all others.
+Add schema_creator_validator.py
+Responsibilities:
+validate CREATE DATABASE queries
+validate CREATE TABLE queries
+sanitize identifiers
+validate schema structure
+
+
+================================================================================
+PHASE 5
+================================================================================
+
+Phase 5 — SQL Execution & Response System
+Goal
+Execute validated SQL queries against the live PostgreSQL database and return structured, user-friendly results to the frontend. This phase completes the core pipeline: natural language → SQL generation → validation → execution → formatted output.
+Technologies Used
+Technology
+Version / Notes
+Why It Is Used
+PostgreSQL
+15.x
+Database where queries are executed
+psycopg2-binary
+2.9.x
+Executes queries and manages transactions
+FastAPI
+0.110.x
+Backend framework (continued)
+React
+18.x
+Displays query results in the frontend
+Pydantic
+2.6.x
+Structures execution result responses
+Project Folder Structure (additions to Phase 4)
+backend/
+├── main.py
+├── routers/
+│   ├── chat.py                    # UPDATED — full pipeline with execution
+│   └── schema.py
+├── models/
+│   └── schemas.py                 # UPDATED — adds ExecutionResult model
+├── db/
+│   ├── connection.py
+│   ├── schema_fetcher.py
+│   └── executor.py                # NEW — executes SQL and returns results
+├── state/
+│   └── metadata_store.py
+├── ai/
+│   ├── gemini_client.py
+│   ├── prompt_builder.py
+│   └── sql_extractor.py
+├── validation/
+│   ├── sql_validator.py
+│   ├── safety_checker.py
+│   └── schema_checker.py
+└── requirements.txt
+Frontend additions:
+frontend/src/
+├── components/
+│   ├── ResultsTable.jsx           # NEW — renders SELECT results as a table
+│   ├── ExecutionMessage.jsx       # NEW — shows INSERT/UPDATE/DELETE outcome
+│   └── ConfirmationModal.jsx      # NEW — confirmation dialog for HIGH_RISK
+└── services/
+└── api.js                     # UPDATED — adds confirmExecution()
+Files — What Each File Does
+backend/db/executor.py
+The core execution module. Contains a single function execute_query(sql: str, dbname: str) -> ExecutionResult.
+Transaction Management:
+SELECT → uses cursor.fetchall(), no commit needed
+INSERT / UPDATE / DELETE → uses connection.commit() on success
+Any error → connection.rollback() to undo partial changes
+import psycopg2
+from db.connection import get_connection
+def execute_query(sql: str, dbname: str) -> ExecutionResult:
+conn = None
+cursor = None
+try:
+conn = get_connection(dbname)
+cursor = conn.cursor()
+cursor.execute(sql)
+sql_upper = sql.strip().upper()
+if sql_upper.startswith("SELECT"):
+rows = cursor.fetchall()
+columns = [desc[0] for desc in cursor.description]
+conn.commit()
+return ExecutionResult(
+success=True,
+operation="SELECT",
+columns=columns,
+rows=[list(row) for row in rows],
+row_count=len(rows),
+message=f"{len(rows)} record(s) found."
+)
+else:
+conn.commit()
+affected = cursor.rowcount
+op = "INSERT" if "INSERT" in sql_upper else "UPDATE" if "UPDATE" in sql_upper else "DELETE"
+return ExecutionResult(
+success=True,
+operation=op,
+columns=[],
+rows=[],
+row_count=affected,
+message=f"{op} successful. {affected} row(s) affected."
+)
+except psycopg2.Error as e:
+if conn:
+conn.rollback()
+return ExecutionResult(
+success=False,
+operation="ERROR",
+columns=[],
+rows=[],
+row_count=0,
+message=str(e)
+)
+finally:
+if cursor: cursor.close()
+if conn: conn.close()
+backend/models/schemas.py (updated)
+class ExecutionResult(BaseModel):
+success: bool
+operation: str            # SELECT | INSERT | UPDATE | DELETE | ERROR
+columns: list[str]        # Column headers for SELECT results
+rows: list[list]          # Row data for SELECT results
+row_count: int
+message: str
+class ChatResponse(BaseModel):
+reply: str
+sql: str | None = None
+validation_error: str | None = None
+requires_confirmation: bool = False
+risk_level: str | None = None
+execution: ExecutionResult | None = None   # NEW
+backend/routers/chat.py (updated — full pipeline)
+@router.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+# Step 1: Generate SQL (Phase 3)
+sql = generate_and_extract_sql(request.message)
+if sql is None:
+return ChatResponse(reply="Could not generate SQL for your question.", sql=None)
+# Step 2: Validate SQL (Phase 4)
+validation = validate_sql(sql)
+if not validation.passed:
+return ChatResponse(reply=f"Query blocked: {validation.error_message}", sql=sql,
+validation_error=validation.error_message)
+if validation.requires_confirmation:
+return ChatResponse(reply="This operation modifies data. Please confirm to proceed.",
+sql=sql, requires_confirmation=True, risk_level=validation.risk_level)
+# Step 3: Execute SQL (Phase 5)
+dbname = get_metadata()["selected_db"]
+result = execute_query(sql, dbname)
+return ChatResponse(reply=result.message, sql=sql, execution=result)
+@router.post("/execute-confirmed")
+async def execute_confirmed(request: ConfirmedExecutionRequest):
+"""Executes a HIGH_RISK query after explicit user confirmation."""
+validation = validate_sql(request.sql)
+# Re-validate to prevent replay attacks with arbitrary SQL
+if not validation.passed:
+return ChatResponse(reply=f"Query blocked: {validation.error_message}", sql=request.sql)
+dbname = get_metadata()["selected_db"]
+result = execute_query(request.sql, dbname)
+return ChatResponse(reply=result.message, sql=request.sql, execution=result)
+New model for confirmed execution:
+class ConfirmedExecutionRequest(BaseModel):
+sql: str
+Frontend Changes
+src/components/ResultsTable.jsx
+Renders SELECT query results as a styled HTML table with column headers.
+function ResultsTable({ columns, rows }) {
+if (!rows.length) return <p className="text-gray-500">No records found.</p>
+return (
+<div className="overflow-x-auto mt-2">
+<table className="min-w-full border text-sm">
+<thead className="bg-blue-50">
+<tr>
+{columns.map(col => (
+<th key={col} className="border px-3 py-1 text-left font-semibold">{col}</th>
+))}
+</tr>
+</thead>
+<tbody>
+{rows.map((row, i) => (
+<tr key={i} className={i % 2 === 0 ? "bg-white" : "bg-gray-50"}>
+{row.map((cell, j) => (
+<td key={j} className="border px-3 py-1">{String(cell ?? "")}</td>
+))}
+</tr>
+))}
+</tbody>
+</table>
+<p className="text-xs text-gray-400 mt-1">{rows.length} record(s) returned</p>
+</div>
+)
+}
+src/components/ExecutionMessage.jsx
+Displays the outcome of INSERT / UPDATE / DELETE operations.
+function ExecutionMessage({ operation, rowCount, message }) {
+const icon = { INSERT: "✅", UPDATE: "✏️", DELETE: "🗑️", ERROR: "❌" }[operation] ?? "ℹ️"
+return (
+<div className={`p-2 rounded mt-2 text-sm ${operation === "ERROR" ? "bg-red-50 text-red-700" : "bg-green-50 text-green-700"}`}>
+{icon} {message}
+</div>
+)
+}
+src/components/ConfirmationModal.jsx
+function ConfirmationModal({ sql, onConfirm, onCancel }) {
+return (
+<div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
+<div className="bg-white rounded-lg p-6 max-w-lg w-full shadow-xl">
+<h3 className="text-lg font-semibold text-orange-600">⚠️ Confirm Operation</h3>
+<p className="mt-2 text-sm text-gray-600">This operation will modify database data:</p>
+<pre className="mt-2 bg-gray-100 p-3 rounded text-sm overflow-x-auto">{sql}</pre>
+<div className="flex gap-3 mt-4">
+<button onClick={onCancel} className="px-4 py-2 border rounded text-gray-700 hover:bg-gray-100">Cancel</button>
+<button onClick={() => onConfirm(sql)} className="px-4 py-2 bg-orange-500 text-white rounded hover:bg-orange-600">Confirm</button>
+</div>
+</div>
+</div>
+)
+}
+src/services/api.js (updated)
+export async function confirmExecution(sql) {
+const response = await apiClient.post('/api/execute-confirmed', { sql })
+return response.data
+}
+How Files Interact
+Full pipeline for a SELECT query:
+─────────────────────────────────
+"Show all employees"
+→ chat.py
+→ AI generates: SELECT * FROM employees;
+→ validator: SAFE
+→ executor.execute_query("SELECT * FROM employees;", "hr_db")
+→ psycopg2 runs query
+→ returns { columns: ["id","name","salary",...], rows: [[1,"Alice",60000],...] }
+→ ChatResponse.execution populated
+→ frontend renders ResultsTable
+Full pipeline for a DELETE query:
+─────────────────────────────────
+"Delete employee with id 5"
+→ AI generates: DELETE FROM employees WHERE id = 5;
+→ validator: HIGH_RISK + requires_confirmation
+→ frontend shows ConfirmationModal
+→ user clicks Confirm
+→ POST /api/execute-confirmed { sql: "DELETE FROM employees WHERE id = 5;" }
+→ executor runs DELETE + commit
+→ returns { operation: "DELETE", row_count: 1, message: "DELETE successful. 1 row(s) affected." }
+→ frontend shows ExecutionMessage (green success)
+Response Format by Operation Type
+Operation
+Execution Result Shape
+Frontend Component
+SELECT
+columns + rows + row_count
+ResultsTable
+INSERT
+row_count, message: "INSERT successful. 1 row(s) affected."
+ExecutionMessage
+UPDATE
+row_count, message: "UPDATE successful. N row(s) affected."
+ExecutionMessage
+DELETE
+row_count, message: "DELETE successful. N row(s) affected."
+ExecutionMessage
+ERROR
+success: false, message: <psycopg2 error>
+ExecutionMessage (red)
+Implementation Steps
+Step 1 — Database Execution Logic
+Write executor.py with SELECT and DML branches
+Test with hardcoded SQL strings before wiring to chat
+Step 2 — Transaction Handling
+Ensure commit() on success and rollback() on any exception
+Test: execute a valid INSERT, then verify rollback on a bad query
+Step 3 — Result Fetching
+Test cursor.fetchall() and cursor.description for column headers
+Handle edge case: SELECT returns 0 rows (not an error)
+Step 4 — Response Formatting
+Update ChatResponse with ExecutionResult
+Update chat.py to populate execution field
+Step 5 — Frontend Display
+Build ResultsTable, ExecutionMessage, ConfirmationModal
+Wire App.jsx to show correct component based on execution.operation
+Implement confirmExecution in api.js
+Error Handling Plan
+Scenario
+Handling
+SQL syntax error at execution time
+psycopg2 raises ProgrammingError → rollback → ExecutionResult(success=False)
+Foreign key constraint violation
+psycopg2 raises IntegrityError → rollback → error message shown
+No database selected
+Guard in chat.py → "Please select a database first"
+Connection lost during execution
+psycopg2 raises OperationalError → caught → "Database connection lost"
+SELECT returns thousands of rows
+fetchall() still works; frontend table scrolls horizontally; Phase 10 adds pagination
+Expected Output at End of Phase 5
+"Show all employees" → table rendered in frontend with all rows and columns
+"Insert new employee named Bob with salary 55000" → "INSERT successful. 1 row(s) affected."
+"Update salary of employee id 3 to 70000" → confirmation modal → after confirm: "UPDATE successful."
+"Delete employee id 5" → confirmation modal → after confirm: "DELETE successful."
+SQL syntax errors at execution time show a clear error message without crashing
+What Is NOT in This Phase
+Conversation memory (Phase 6)
+Multi-database routing (Phase 7)
+Agent tool calling (Phase 8)
+Logging / audit trail (Phase 9)
+ADDITIONAL REQUIREMENTS — DATABASE/TABLE EXECUTION ENGINE
+Extend execution engine to support PostgreSQL structure management.
+Support Execution Of
+CREATE DATABASE
+CREATE TABLE
+SELECT
+INSERT
+UPDATE
+DELETE
+CREATE DATABASE Handling
+IMPORTANT:PostgreSQL requires:
+conn.autocommit = True
+before executing:CREATE DATABASE
+The executor must detect:CREATE DATABASE
+and automatically switch execution mode.
+Dynamic Database Connection Switching
+When user selects database:
+create new PostgreSQL connection dynamically
+execute operations against selected database
+Automatic Schema Refresh
+After:
+CREATE DATABASE
+CREATE TABLE
+automatically:
+refresh schema cache
+refresh tables list
+refresh routing metadata
+Structured Execution Response
+Return JSON:
+{"success": true,"operation": "CREATE_TABLE","database": "hr_database","table": "interns","message": "Table created successfully"}
+Error Handling
+Handle:
+duplicate database
+duplicate table
+invalid SQL
+connection failures
+permission failures
+
+
+================================================================================
+PHASE 6
+================================================================================
+
+Phase 6 — Memory & Conversation Context System
+Goal
+Enable the system to remember previous messages within a session so that follow-up questions are understood correctly. Instead of treating every message as a fresh, standalone request, the AI receives the recent conversation history alongside the current question.
+Technologies Used
+Technology
+Version / Notes
+Why It Is Used
+Python (in-memory dict)
+Built-in
+Stores conversation history per session
+FastAPI
+0.110.x
+Manages session identifiers via request headers
+Gemini API
+gemini-1.5-flash
+Generates context-aware SQL using history
+UUID (Python stdlib)
+Built-in
+Generates unique session IDs
+React (useState)
+18.x
+Stores session ID in frontend state
+Project Folder Structure (additions to Phase 5)
+backend/
+├── main.py
+├── routers/
+│   └── chat.py                    # UPDATED — reads/writes session history
+├── models/
+│   └── schemas.py                 # UPDATED — adds session_id to request
+├── state/
+│   ├── metadata_store.py
+│   └── session_store.py           # NEW — in-memory conversation history per session
+├── ai/
+│   ├── gemini_client.py
+│   ├── prompt_builder.py          # UPDATED — injects conversation history
+│   └── sql_extractor.py
+├── db/
+│   └── ...
+└── validation/
+└── ...
+Files — What Each File Does
+backend/state/session_store.py
+Holds conversation history keyed by session ID. Each session stores a list of {role, content} message objects.
+from collections import defaultdict
+# Structure: { "session-uuid": [ {role, content}, ... ] }
+_sessions: dict[str, list] = defaultdict(list)
+MAX_HISTORY_TURNS = 10    # Keep last 10 exchanges to avoid token overflow
+def get_history(session_id: str) -> list:
+return _sessions[session_id][-MAX_HISTORY_TURNS * 2:]  # Each turn = 2 messages
+def add_message(session_id: str, role: str, content: str):
+"""role = 'user' or 'assistant'"""
+_sessions[session_id].append({"role": role, "content": content})
+def clear_session(session_id: str):
+if session_id in _sessions:
+del _sessions[session_id]
+def session_exists(session_id: str) -> bool:
+return session_id in _sessions
+MAX_HISTORY_TURNS = 10 prevents prompt size from growing unboundedly. Only the most recent 10 user+assistant pairs are included.
+backend/ai/prompt_builder.py (updated)
+Adds a new function build_prompt_with_history that formats the conversation history into the prompt.
+SYSTEM_INSTRUCTIONS = """..."""  # unchanged from Phase 3
+def format_history(history: list) -> str:
+if not history:
+return ""
+lines = ["CONVERSATION HISTORY (most recent last):"]
+for msg in history:
+role = "User" if msg["role"] == "user" else "Assistant"
+lines.append(f"{role}: {msg['content']}")
+return "\n".join(lines)
+def build_prompt_with_history(schema_str: str, history: list, user_question: str) -> str:
+history_section = format_history(history)
+return f"""{SYSTEM_INSTRUCTIONS}
+DATABASE SCHEMA:
+{schema_str}
+{history_section}
+CURRENT USER QUESTION:
+{user_question}
+SQL QUERY:"""
+Example of what Gemini receives with history:
+You are a PostgreSQL expert...
+DATABASE SCHEMA:
+Table: employees
+Columns: id, name, salary, department_id
+CONVERSATION HISTORY (most recent last):
+User: Show all employees from HR department
+Assistant: SELECT * FROM employees WHERE department_id = (SELECT id FROM departments WHERE name = 'HR');
+CURRENT USER QUESTION:
+Increase their salary by 10%
+SQL QUERY:
+Gemini can now infer that "their" refers to HR employees.
+backend/models/schemas.py (updated)
+class ChatRequest(BaseModel):
+message: str
+session_id: str | None = None   # NEW — client sends their session ID
+backend/routers/chat.py (updated)
+import uuid
+from state.session_store import get_history, add_message
+@router.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+# Resolve or create session
+session_id = request.session_id or str(uuid.uuid4())
+# Fetch history
+history = get_history(session_id)
+# Generate SQL with history context
+schema = get_metadata()["schema"]
+schema_str = format_schema_for_prompt(schema)
+prompt = build_prompt_with_history(schema_str, history, request.message)
+raw = generate_sql(prompt)
+sql = extract_sql(raw)
+# Store this exchange in history
+add_message(session_id, "user", request.message)
+if sql:
+add_message(session_id, "assistant", sql)
+else:
+add_message(session_id, "assistant", "Could not generate SQL.")
+# Validate + Execute (Phase 4 + 5 logic unchanged)
+if sql is None:
+return ChatResponse(reply="Could not generate SQL.", session_id=session_id)
+validation = validate_sql(sql)
+if not validation.passed:
+return ChatResponse(reply=f"Blocked: {validation.error_message}", sql=sql, session_id=session_id)
+if validation.requires_confirmation:
+return ChatResponse(reply="Confirm to proceed.", sql=sql, requires_confirmation=True,
+session_id=session_id)
+dbname = get_metadata()["selected_db"]
+result = execute_query(sql, dbname)
+return ChatResponse(reply=result.message, sql=sql, execution=result, session_id=session_id)
+The session_id is returned in every response so the frontend can persist and reuse it.
+backend/models/schemas.py (updated)
+class ChatResponse(BaseModel):
+reply: str
+sql: str | None = None
+execution: ExecutionResult | None = None
+validation_error: str | None = None
+requires_confirmation: bool = False
+risk_level: str | None = None
+session_id: str | None = None   # NEW — echoed back for client to store
+Frontend Changes
+src/App.jsx (updated)
+Store sessionId in state. Send it with every request.
+const [sessionId, setSessionId] = useState(null)
+async function handleSend(text) {
+const data = await sendMessage(text, sessionId)
+if (!sessionId && data.session_id) {
+setSessionId(data.session_id)   // Lock in session ID from first response
+}
+// ... update messages
+}
+src/services/api.js (updated)
+export async function sendMessage(text, sessionId = null) {
+const response = await apiClient.post('/api/chat', {
+message: text,
+session_id: sessionId
+})
+return response.data
+}
+The session ID is stored only in React state (in memory). It is lost on page refresh, which is the intended behaviour — Phase 6 implements session-scoped memory only, not persistent memory.
+How Files Interact
+Turn 1:
+User: "Show employees in HR"
+session_id = null (first message)
+→ chat.py creates new UUID → "abc-123"
+→ history = []  (empty)
+→ prompt has no history section
+→ Gemini generates: SELECT * FROM employees WHERE department_id = ...
+→ add_message("abc-123", "user", "Show employees in HR")
+→ add_message("abc-123", "assistant", "SELECT * FROM employees WHERE...")
+→ response includes session_id = "abc-123"
+→ frontend stores "abc-123"
+Turn 2:
+User: "Increase their salary by 10%"
+session_id = "abc-123" (sent from frontend)
+→ history = [
+{role: "user",      content: "Show employees in HR"},
+{role: "assistant", content: "SELECT * FROM employees WHERE..."}
+]
+→ prompt includes history section
+→ Gemini understands "their" = HR employees
+→ Generates UPDATE with correct WHERE clause
+Memory Lifecycle
+Event
+Effect on Memory
+First message (no session_id)
+New session created with fresh UUID
+Subsequent messages (with session_id)
+History appended
+Page refresh
+Frontend loses session_id → new session starts
+Backend restart
+All sessions cleared (in-memory only)
+History exceeds MAX_HISTORY_TURNS
+Only latest N turns are included in prompt
+Ambiguous Context Handling
+When the AI cannot resolve a follow-up reference from context, it should return CANNOT_GENERATE. The chat.py endpoint then returns:
+"I couldn't understand the follow-up question. Please rephrase or start a new request."
+This prevents incorrect SQL from being generated when context is insufficient.
+Implementation Steps
+Step 1 — Session Setup
+Create state/session_store.py
+Write unit tests for get_history, add_message, clear_session
+Step 2 — Chat History Storage
+Update chat.py to call add_message after each exchange
+Verify history grows correctly across multiple turns
+Step 3 — Context Injection
+Update prompt_builder.py with build_prompt_with_history
+Test prompt output manually to confirm history is formatted correctly
+Step 4 — Context-Aware Query Handling
+End-to-end test: ask a question, follow up with a pronoun reference, verify correct SQL
+Step 5 — Memory Cleanup
+Add DELETE /api/session/{session_id} endpoint for explicit session reset
+Frontend can call this when user clicks "New Conversation" button
+Error Handling Plan
+Scenario
+Handling
+session_id not found in store
+Treat as new session, create fresh history
+History grows too large
+Trim to MAX_HISTORY_TURNS before prompt assembly
+Ambiguous follow-up
+Gemini returns CANNOT_GENERATE → user sees clarification request
+Concurrent sessions
+Each session keyed independently; no cross-contamination
+Expected Output at End of Phase 6
+"Show employees in HR department" → correct SELECT
+Follow-up "Increase their salary by 10%" → correct UPDATE referencing HR employees
+Follow-up "Now show only those earning above 60000" → SELECT with both conditions
+Page refresh → new session starts with no prior context
+More than 10 turns → earliest turns are silently dropped from the prompt
+What Is NOT in This Phase
+Persistent (cross-session / cross-restart) memory
+Multi-database routing (Phase 7)
+Agent / tool calling (Phase 8)
+Logging (Phase 9)
+ADDITIONAL MODIFICATION — DATABASE & TABLE CONTEXT MEMORY
+Extend conversational memory system to support PostgreSQL database management context.
+NEW MEMORY CAPABILITIES:
+remember selected database
+remember selected table
+remember recently created databases
+remember recently created tables
+maintain schema context across conversation
+Session Memory Updates
+Store the following per session:
+selectedDatabase
+selectedTable
+recentDatabases
+recentTables
+recentSchemaOperations
+Database Context Persistence
+If user says:"Create interns table"
+the AI must understand:
+which database is currently selected
+where table should be created
+without asking again unnecessarily.
+Table Context Persistence
+If user previously selected:interns table
+and later says:"Insert Rahul into it"
+the AI should infer:
+current table = interns
+Schema Operation Memory
+Track recent operations:
+created databases
+created tables
+inserted records
+updated records
+This improves follow-up query accuracy.
+Context Injection Into AI Prompt
+Pass memory context into AI generation layer:
+selected database
+selected table
+available tables
+recently created schemas
+Session Switching
+Ensure different users/sessions maintain isolated:
+database selections
+table selections
+schema memory
+Memory Reset Rules
+When database changes:
+refresh table context
+refresh schema cache
+update AI memory context
+Error Recovery
+If remembered table/database no longer exists:
+automatically refresh metadata
+request valid selection gracefully
+
+
+================================================================================
+PHASE 7
+================================================================================
+
+Phase 7 — Multi-Database Routing System
+Goal
+Allow the system to work across multiple PostgreSQL databases simultaneously. Instead of requiring the user to manually select a database, the AI automatically identifies which database is most relevant for the user's query by analysing available database names and their schema metadata.
+Technologies Used
+Technology
+Version / Notes
+Why It Is Used
+PostgreSQL
+15.x
+Hosts multiple independent databases
+Gemini API
+gemini-1.5-flash
+Performs intelligent database selection
+FastAPI
+0.110.x
+Backend routing and request handling
+psycopg2-binary
+2.9.x
+Connects to whichever database is selected
+Python
+3.11+
+Routing logic and metadata management
+Project Folder Structure (additions to Phase 6)
+backend/
+├── main.py
+├── routers/
+│   ├── chat.py                    # UPDATED — routing step before SQL generation
+│   └── schema.py                  # UPDATED — fetches schema for ALL databases at startup
+├── models/
+│   └── schemas.py
+├── state/
+│   ├── metadata_store.py          # UPDATED — stores schema for multiple databases
+│   └── session_store.py
+├── ai/
+│   ├── gemini_client.py
+│   ├── prompt_builder.py          # UPDATED — adds routing prompt
+│   ├── router_ai.py               # NEW — routing prompt + Gemini call
+│   └── sql_extractor.py
+├── db/
+│   ├── connection.py
+│   ├── schema_fetcher.py          # UPDATED — fetches schema for all DBs at once
+│   └── executor.py
+└── validation/
+└── ...
+Files — What Each File Does
+backend/state/metadata_store.py (updated)
+Extended to hold schema for all databases, not just the selected one.
+_store = {
+"databases": [],              # List[str]
+"selected_db": None,          # str — AI-selected database for current query
+"schema": {},                 # Schema of selected_db only (used in SQL prompt)
+"all_schemas": {}             # NEW: Dict[str, Dict[str, List[str]]]
+# { "hr_db": {"employees": [...], ...},
+#   "inventory_db": {"products": [...], ...} }
+}
+def set_all_schemas(schemas: dict): ...
+def get_all_schemas() -> dict: ...
+def build_routing_summary() -> str: ...  # Formats all schemas for routing prompt
+build_routing_summary() produces a compact string describing every database:
+Database: hr_db
+Tables: employees (id, name, salary, department_id), departments (id, name, location)
+Database: inventory_db
+Tables: products (id, name, stock, category, price), suppliers (id, name)
+Database: finance_db
+Tables: transactions (id, amount, date, account_id), accounts (id, owner, balance)
+backend/db/schema_fetcher.py (updated)
+Adds fetch_all_schemas() -> dict which iterates over all discovered databases and fetches their schema into a dict keyed by database name.
+def fetch_all_schemas(databases: list[str]) -> dict:
+result = {}
+for dbname in databases:
+try:
+result[dbname] = fetch_schema(dbname)
+except Exception:
+result[dbname] = {}    # Skip unreachable DB, don't crash
+return result
+Called once at startup (or when databases list is refreshed) and stored in metadata_store.
+backend/ai/router_ai.py
+A separate Gemini call that happens before SQL generation. Its only job is to choose which database to route the query to.
+ROUTING_SYSTEM_PROMPT = """
+You are a database routing assistant.
+Given a user question and a list of databases with their table/column summaries,
+return ONLY the name of the most relevant database.
+Return nothing else — just the database name exactly as listed.
+If no database is relevant, return: UNKNOWN
+"""
+def select_database(user_question: str, routing_summary: str) -> str | None:
+prompt = f"""{ROUTING_SYSTEM_PROMPT}
+AVAILABLE DATABASES:
+{routing_summary}
+USER QUESTION:
+{user_question}
+SELECTED DATABASE:"""
+raw = generate_sql(prompt)   # reuses gemini_client.generate_sql
+selected = raw.strip().lower()
+# Validate response is a known database name
+known_dbs = [db.lower() for db in get_metadata()["databases"]]
+if selected in known_dbs:
+return selected
+return None   # UNKNOWN or hallucinated name → fall back to asking user
+backend/routers/chat.py (updated — routing step)
+@router.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+session_id = request.session_id or str(uuid.uuid4())
+history = get_history(session_id)
+# Step 1: Route to correct database
+routing_summary = build_routing_summary()
+selected_db = select_database(request.message, routing_summary)
+if selected_db is None:
+return ChatResponse(
+reply="I could not determine which database to use. Please clarify.",
+session_id=session_id
+)
+# Load that database's schema
+all_schemas = get_all_schemas()
+schema = all_schemas.get(selected_db, {})
+set_selected_db(selected_db)
+set_schema(schema)
+# Step 2: Generate SQL using selected schema (Phase 3 logic)
+schema_str = format_schema_for_prompt(schema)
+prompt = build_prompt_with_history(schema_str, history, request.message)
+raw = generate_sql(prompt)
+sql = extract_sql(raw)
+# Steps 3+4: Validate + Execute (Phase 4 + 5 logic)
+# ... (unchanged)
+return ChatResponse(
+reply=result.message,
+sql=sql,
+execution=result,
+selected_database=selected_db,   # NEW — tell frontend which DB was used
+session_id=session_id
+)
+backend/models/schemas.py (updated)
+class ChatResponse(BaseModel):
+reply: str
+sql: str | None = None
+execution: ExecutionResult | None = None
+validation_error: str | None = None
+requires_confirmation: bool = False
+risk_level: str | None = None
+session_id: str | None = None
+selected_database: str | None = None   # NEW
+App Startup: Loading All Schemas
+In backend/main.py, add a startup event to pre-load all database schemas:
+from contextlib import asynccontextmanager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+# On startup: discover and cache all schemas
+databases = fetch_all_databases()
+set_databases(databases)
+all_schemas = fetch_all_schemas(databases)
+set_all_schemas(all_schemas)
+yield
+# On shutdown: (cleanup if needed)
+app = FastAPI(title="AI SQL Assistant", lifespan=lifespan)
+This means schema metadata is ready before the first request.
+How Files Interact
+User: "Show products with low stock"
+│
+▼
+chat.py → router_ai.select_database(question, routing_summary)
+│
+▼
+Routing prompt sent to Gemini:
+AVAILABLE DATABASES:
+Database: hr_db
+Tables: employees (id, name, salary), departments (id, name)
+Database: inventory_db
+Tables: products (id, name, stock, category)
+Database: finance_db
+Tables: transactions (id, amount, date)
+USER QUESTION: Show products with low stock
+SELECTED DATABASE:
+│
+Gemini returns: "inventory_db"
+│
+▼
+schema = all_schemas["inventory_db"]
+│
+▼
+SQL generation prompt:
+DATABASE SCHEMA:
+Table: products
+Columns: id, name, stock, category, price
+USER QUESTION: Show products with low stock
+│
+Gemini: SELECT * FROM products WHERE stock < 10;
+│
+▼
+Validate → Execute on inventory_db → Return results
+│
+▼
+ChatResponse(selected_database="inventory_db", ...)
+Frontend Changes
+Database indicator
+Show the selected database name in the chat window below the AI response:
+{message.selected_database && (
+<p className="text-xs text-gray-400 mt-1">
+🗄️ Using database: <span className="font-mono">{message.selected_database}</span>
+</p>
+)}
+This builds user trust and transparency.
+Routing Accuracy Considerations
+Scenario
+Behaviour
+Query clearly matches one DB
+Gemini routes correctly
+Query matches multiple DBs
+Gemini picks the most specific one based on table names
+Query is ambiguous
+select_database returns None → user asked to clarify
+Query uses a table that exists in multiple DBs
+Gemini picks based on context; may add clarification message
+User mentions DB name explicitly ("in inventory")
+Routing prompt captures this; Gemini honours the hint
+Implementation Steps
+Step 1 — Multi-Database Setup
+Create hr_db, inventory_db, finance_db with distinct tables and seed data (see Phase 2 setup)
+Step 2 — Database Metadata Fetching
+Update schema_fetcher.py with fetch_all_schemas()
+Wire startup event in main.py
+Verify all_schemas is populated with correct data
+Step 3 — Routing Prompt Creation
+Write router_ai.py
+Test routing prompt manually with different questions
+Step 4 — Database Selection Logic
+Test select_database() with edge cases: ambiguous queries, unknown topics
+Validate returned DB name is in the known list
+Step 5 — Dynamic Schema Injection
+Update chat.py to set schema from all_schemas[selected_db] before prompt building
+Remove the manual "select a database" requirement from the UI
+Error Handling Plan
+Scenario
+Handling
+Routing returns UNKNOWN
+Return "Please clarify which database or topic you mean"
+Selected DB unreachable at execution
+psycopg2 error → caught → "Database unavailable"
+Schema for selected DB is empty
+Guard in chat.py → "No tables found in selected database"
+New DB added after startup
+GET /api/databases/refresh endpoint re-runs fetch_all_schemas
+Expected Output at End of Phase 7
+"Show employees with salary above 50000" → routes to hr_db automatically
+"Show products with low stock" → routes to inventory_db automatically
+"Show recent transactions" → routes to finance_db automatically
+User never manually selects a database
+Selected database name is visible in the chat response
+What Is NOT in This Phase
+Agent / tool calling (Phase 8)
+Logging and audit trail (Phase 9)
+Export and advanced analytics (Phase 10)
+ADDITIONAL MODIFICATION — DYNAMIC MULTI-DATABASE ROUTING
+Extend routing system to support dynamically created PostgreSQL databases and tables.
+NEW CAPABILITIES:
+route queries across multiple databases
+detect newly created databases
+detect newly created tables
+refresh routing metadata automatically
+Dynamic Database Routing
+The routing layer must:
+understand multiple PostgreSQL databases
+dynamically switch connections
+route AI-generated SQL to correct database
+Dynamic Schema Refresh
+Whenever:
+CREATE DATABASE executed
+CREATE TABLE executed
+automatically:
+refresh schema cache
+refresh database summaries
+refresh routing metadata
+rebuild database map
+Intelligent Database Selection
+If user does not specify database explicitly:AI should infer target database using:
+previous context
+schema relevance
+table existence
+Multi-Database Metadata Store
+Maintain:
+all databases
+all tables
+schema summaries
+column metadata
+table relationships
+Database Routing Summaries
+Generate compact summaries for AI:
+Example:Database: hr_databaseTables:
+interns(name, college, stipend)
+employees(name, department)
+Dynamic Connection Switching
+The routing layer must dynamically:
+open PostgreSQL connections
+switch databases
+close unused connections safely
+Schema Discovery Optimization
+Cache:
+table metadata
+column metadata
+schema summaries
+Refresh only when schema changes occur.
+Newly Created Database Awareness
+Immediately after database creation:
+new DB must become selectable
+AI routing must recognize it
+dropdowns must refresh automatically
+Newly Created Table Awareness
+Immediately after table creation:
+table must appear in selector
+AI prompt context must update
+routing summaries must rebuild
+
+
+================================================================================
+PHASE 8
+================================================================================
+
+Phase 8 — Agent & Tool Calling System
+Goal
+Evolve the system from a simple SQL generator into an intelligent AI agent. Instead of always generating SQL, the AI decides which tool to use for each request — it may execute SQL, generate a text summary, create a report, or chain multiple tools together for complex multi-step tasks.
+Technologies Used
+Technology
+Version / Notes
+Why It Is Used
+Gemini Function Calling
+Gemini 1.5 Flash/Pro
+Structured tool selection by AI
+google-generativeai SDK
+0.5.x
+Enables tools= parameter for function calling
+FastAPI
+0.110.x
+Registers and executes backend tools
+Python functions
+Custom
+Implements each tool's logic
+PostgreSQL + psycopg2
+15.x / 2.9.x
+SQL execution tool backend
+Project Folder Structure (additions to Phase 7)
+backend/
+├── main.py
+├── routers/
+│   └── chat.py                    # UPDATED — agent dispatch loop
+├── models/
+│   └── schemas.py                 # UPDATED — agent response model
+├── state/
+│   ├── metadata_store.py
+│   └── session_store.py
+├── ai/
+│   ├── gemini_client.py           # UPDATED — supports function calling
+│   ├── prompt_builder.py
+│   ├── router_ai.py
+│   └── sql_extractor.py
+├── agent/
+│   ├── __init__.py
+│   ├── tool_registry.py           # NEW — defines tools for Gemini function calling
+│   ├── tool_executor.py           # NEW — executes selected tool by name
+│   └── tools/
+│       ├── sql_tool.py            # NEW — wraps executor.execute_query
+│       ├── summary_tool.py        # NEW — generates text summary of results
+│       ├── report_tool.py         # NEW — formats results into a readable report
+│       └── schema_info_tool.py    # NEW — answers schema/structure questions
+├── db/
+│   └── ...
+└── validation/
+└── ...
+Files — What Each File Does
+backend/agent/tool_registry.py
+Defines the tools that Gemini can call. Each tool is described as a Gemini Tool object with a FunctionDeclaration.
+import google.generativeai as genai
+tools = genai.protos.Tool(
+function_declarations=[
+genai.protos.FunctionDeclaration(
+name="execute_sql",
+description="Executes a SQL query on the PostgreSQL database and returns results.",
+parameters=genai.protos.Schema(
+type=genai.protos.Type.OBJECT,
+properties={
+"query": genai.protos.Schema(
+type=genai.protos.Type.STRING,
+description="The SQL query to execute."
+)
+},
+required=["query"]
+)
+),
+genai.protos.FunctionDeclaration(
+name="summarize_results",
+description="Generates a plain-English summary of query results.",
+parameters=genai.protos.Schema(
+type=genai.protos.Type.OBJECT,
+properties={
+"data": genai.protos.Schema(
+type=genai.protos.Type.STRING,
+description="JSON-encoded query result to summarise."
+),
+"context": genai.protos.Schema(
+type=genai.protos.Type.STRING,
+description="The original user question for context."
+)
+},
+required=["data", "context"]
+)
+),
+genai.protos.FunctionDeclaration(
+name="get_schema_info",
+description="Returns information about available tables and columns.",
+parameters=genai.protos.Schema(
+type=genai.protos.Type.OBJECT,
+properties={
+"table_name": genai.protos.Schema(
+type=genai.protos.Type.STRING,
+description="Optional: specific table to get info about."
+)
+}
+)
+),
+genai.protos.FunctionDeclaration(
+name="generate_report",
+description="Creates a formatted text report from query results.",
+parameters=genai.protos.Schema(
+type=genai.protos.Type.OBJECT,
+properties={
+"data": genai.protos.Schema(
+type=genai.protos.Type.STRING,
+description="JSON-encoded data to include in the report."
+),
+"title": genai.protos.Schema(
+type=genai.protos.Type.STRING,
+description="Report title."
+)
+},
+required=["data"]
+)
+)
+]
+)
+backend/ai/gemini_client.py (updated)
+Adds a new function run_agent(prompt, schema_str, history) that uses Gemini's function calling mode.
+def run_agent(system_prompt: str) -> tuple[str | None, str | None]:
+"""
+Returns (tool_name, tool_arguments_dict) if Gemini wants to call a tool.
+Returns (None, response_text) if Gemini gives a plain text response.
+"""
+response = model.generate_content(
+system_prompt,
+tools=[tool_registry.tools]
+)
+candidate = response.candidates[0].content.parts[0]
+if hasattr(candidate, "function_call"):
+fc = candidate.function_call
+return fc.name, dict(fc.args)   # ("execute_sql", {"query": "SELECT ..."})
+return None, candidate.text   # Plain text response
+backend/agent/tools/sql_tool.py
+Wraps the Phase 5 executor. Validates before executing.
+from validation.sql_validator import validate_sql
+from db.executor import execute_query
+from state.metadata_store import get_metadata
+def run_sql_tool(query: str) -> dict:
+validation = validate_sql(query)
+if not validation.passed:
+return {"error": validation.error_message, "requires_confirmation": False}
+if validation.requires_confirmation:
+return {"error": None, "requires_confirmation": True, "sql": query}
+dbname = get_metadata()["selected_db"]
+result = execute_query(query, dbname)
+return {
+"success": result.success,
+"columns": result.columns,
+"rows": result.rows,
+"row_count": result.row_count,
+"message": result.message
+}
+backend/agent/tools/summary_tool.py
+Sends the raw data back to Gemini with a summarisation prompt.
+import json
+def run_summary_tool(data: str, context: str) -> str:
+prompt = f"""
+Given this database query result:
+{data}
+Original question: {context}
+Write a concise 2-3 sentence plain-English summary of what the data shows.
+Do not include SQL. Just describe the findings.
+"""
+response = model.generate_content(prompt)
+return response.text
+backend/agent/tools/report_tool.py
+Formats data into a structured Markdown-style report.
+import json
+def run_report_tool(data: str, title: str = "Query Report") -> str:
+try:
+parsed = json.loads(data)
+columns = parsed.get("columns", [])
+rows = parsed.get("rows", [])
+except Exception:
+return "Could not generate report."
+lines = [f"# {title}", ""]
+lines.append("| " + " | ".join(columns) + " |")
+lines.append("| " + " | ".join(["---"] * len(columns)) + " |")
+for row in rows[:50]:   # Limit report to first 50 rows
+lines.append("| " + " | ".join(str(v) for v in row) + " |")
+lines.append(f"\n_Total: {len(rows)} record(s)_")
+return "\n".join(lines)
+backend/agent/tools/schema_info_tool.py
+Answers questions about database structure without querying any data.
+from state.metadata_store import get_metadata
+def run_schema_info_tool(table_name: str = None) -> str:
+schema = get_metadata()["schema"]
+if table_name:
+cols = schema.get(table_name.lower())
+if cols:
+return f"Table '{table_name}' has columns: {', '.join(cols)}"
+return f"Table '{table_name}' not found in the current database."
+lines = [f"Table: {t}\n  Columns: {', '.join(c)}" for t, c in schema.items()]
+return "\n".join(lines)
+backend/agent/tool_executor.py
+Routes a tool call from Gemini to the correct Python function.
+from .tools.sql_tool import run_sql_tool
+from .tools.summary_tool import run_summary_tool
+from .tools.report_tool import run_report_tool
+from .tools.schema_info_tool import run_schema_info_tool
+TOOL_MAP = {
+"execute_sql":       lambda args: run_sql_tool(args["query"]),
+"summarize_results": lambda args: run_summary_tool(args["data"], args.get("context", "")),
+"generate_report":   lambda args: run_report_tool(args["data"], args.get("title", "Report")),
+"get_schema_info":   lambda args: run_schema_info_tool(args.get("table_name")),
+}
+def execute_tool(tool_name: str, tool_args: dict):
+handler = TOOL_MAP.get(tool_name)
+if handler is None:
+return {"error": f"Unknown tool: {tool_name}"}
+return handler(tool_args)
+backend/routers/chat.py (updated — agent dispatch loop)
+@router.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+session_id = request.session_id or str(uuid.uuid4())
+history = get_history(session_id)
+# Phase 7: Route to correct database
+selected_db = select_database(request.message, build_routing_summary())
+if selected_db:
+schema = get_all_schemas()[selected_db]
+set_selected_db(selected_db)
+set_schema(schema)
+# Build agent prompt (schema + history + current question)
+schema_str = format_schema_for_prompt(get_metadata()["schema"])
+agent_prompt = build_agent_prompt(schema_str, history, request.message)
+# Agent loop: Gemini selects tool → execute → potentially loop again
+tool_name, tool_args_or_text = run_agent(agent_prompt)
+if tool_name is None:
+# Gemini gave a plain text answer (e.g. schema question)
+reply = tool_args_or_text
+add_message(session_id, "user", request.message)
+add_message(session_id, "assistant", reply)
+return ChatResponse(reply=reply, session_id=session_id, selected_database=selected_db)
+# Execute the tool Gemini selected
+tool_result = execute_tool(tool_name, tool_args_or_text)
+# If tool requires confirmation, return early
+if tool_result.get("requires_confirmation"):
+return ChatResponse(
+reply="This operation modifies data. Please confirm.",
+sql=tool_result.get("sql"),
+requires_confirmation=True,
+session_id=session_id
+)
+# Build final response
+reply = tool_result.get("message") or "Done."
+execution = build_execution_result(tool_result) if tool_name == "execute_sql" else None
+add_message(session_id, "user", request.message)
+add_message(session_id, "assistant", reply)
+return ChatResponse(
+reply=reply,
+execution=execution,
+tool_used=tool_name,
+session_id=session_id,
+selected_database=selected_db
+)
+Tool Decision Examples
+User Request
+AI Selects
+What Happens
+"Show employees"
+execute_sql
+SQL run, table displayed
+"How many tables are in this database?"
+get_schema_info
+Schema summary returned
+"Show low-stock products and summarise"
+execute_sql then summarize_results
+Data fetched, then summarised
+"Create a report of all transactions"
+execute_sql then generate_report
+Table fetched, Markdown report returned
+"What columns does the employees table have?"
+get_schema_info
+Column list returned without DB query
+Agent Prompt Structure
+You are an intelligent database assistant with access to the following tools:
+- execute_sql: Run SQL queries
+- summarize_results: Summarise data in plain English
+- generate_report: Create a formatted data report
+- get_schema_info: Get table/column information
+DATABASE SCHEMA:
+[schema here]
+CONVERSATION HISTORY:
+[history here]
+CURRENT QUESTION:
+[user question]
+Choose the best tool to answer this question. If no tool is needed, respond directly.
+How Files Interact
+User: "Show low stock products and give me a summary"
+│
+▼
+chat.py → router_ai → selects "inventory_db"
+│
+▼
+run_agent(agent_prompt)
+│
+Gemini selects: execute_sql { query: "SELECT * FROM products WHERE stock < 10;" }
+│
+▼
+tool_executor.execute_tool("execute_sql", {query: ...})
+│
+▼
+sql_tool.run_sql_tool(query)  →  executor.execute_query  →  PostgreSQL result
+│
+▼
+(Agent could loop: send result back to Gemini for summarisation)
+│
+▼
+run_summary_tool(data=result_json, context="Show low stock products and summarise")
+│
+▼
+Gemini generates: "There are 3 products with low stock. The most critical is
+Widget A with only 2 units remaining..."
+│
+▼
+ChatResponse(reply=summary, execution=result, tool_used="execute_sql+summarize_results")
+Implementation Steps
+Step 1 — Tool Architecture Setup
+Create agent/ directory with tool_registry.py, tool_executor.py, and tools/ subfolder
+Write and test each tool independently
+Step 2 — Gemini Function Calling Setup
+Update gemini_client.py to use tools= parameter
+Test basic function call: ask Gemini to call execute_sql
+Step 3 — Tool Execution System
+Wire tool_executor.py into chat.py
+Test all four tools via the chat API
+Step 4 — Multi-Step Action Handling
+Implement chained calls: SQL result → summarise
+Test "show X and summarise" style requests
+Step 5 — Final Response Generation
+Ensure all tool results produce user-friendly replies
+Add tool_used field to ChatResponse for frontend transparency
+Error Handling Plan
+Scenario
+Handling
+Gemini calls unknown tool
+TOOL_MAP returns {"error": "Unknown tool"}
+Tool raises exception
+Caught in execute_tool → returns {"error": str(e)}
+SQL tool fails validation
+Returns requires_confirmation or error message
+Gemini loops infinitely
+Implement max 3 agent turns limit in chat.py
+Expected Output at End of Phase 8
+"Show all employees" → AI selects execute_sql, table displayed (same as before)
+"What tables exist?" → AI selects get_schema_info, no DB query needed
+"Show low-stock products and summarise" → SQL fetches data, AI summarises in plain English
+"Generate a report of all transactions" → SQL fetched, Markdown report returned
+System behaves like an intelligent assistant, not just a SQL generator
+What Is NOT in This Phase
+Logging / audit trail (Phase 9)
+Export to CSV/Excel/PDF (Phase 10)
+Analytics dashboard (Phase 10)
+Deployment (Phase 11)
+ADDITIONAL MODIFICATION — POSTGRESQL MANAGEMENT AGENT TOOLS
+Extend AI agent architecture into full PostgreSQL management agent.
+NEW AGENT CAPABILITIES:
+create databases
+create tables
+list databases
+list tables
+dynamically manage schemas
+Add New Agent Tools
+Create:
+create_database_tool.py
+create_table_tool.py
+list_databases_tool.py
+list_tables_tool.py
+create_database_tool
+Responsibilities:
+validate database names
+create PostgreSQL databases
+refresh metadata automatically
+Input:{"database_name": "hr_database"}
+create_table_tool
+Responsibilities:
+validate table structure
+validate PostgreSQL types
+generate CREATE TABLE SQL safely
+Input:{"database": "hr_database","table_name": "interns","columns": [{"name":"name","type":"TEXT"}]}
+list_databases_tool
+Return:
+all PostgreSQL databases
+metadata summaries
+list_tables_tool
+Return:
+all tables for selected database
+column metadata
+AI Agent Decision Flow
+Example:
+User:"Create HR database and interns table"
+AI agent flow:
+create_database_tool()
+refresh metadata
+create_table_tool()
+Tool Registry Updates
+Register all new PostgreSQL management tools inside:tool_registry.py
+AI Tool Calling Rules
+The AI agent must:
+validate schemas before execution
+avoid duplicate DB/table creation
+refresh metadata after schema operations
+maintain database context
+Schema Awareness
+All tools must operate using:
+selected database
+selected table
+schema cache
+routing summaries
+
+
+================================================================================
+PHASE 9
+================================================================================
+
+Phase 9 — Logging & Monitoring System
+Goal
+Implement a comprehensive logging layer that records every query, AI interaction, execution result, error, and sensitive operation. This makes the system debuggable, auditable, and observable without interrupting normal application flow.
+Technologies Used
+Technology
+Version / Notes
+Why It Is Used
+Python logging module
+Built-in stdlib
+Structured application-level logging
+Python logging.handlers.RotatingFileHandler
+Built-in
+Prevents log files from growing indefinitely
+FastAPI middleware
+Built-in
+Intercepts every HTTP request/response for access logging
+PostgreSQL
+15.x
+Optional persistent log storage for audit trail
+psycopg2-binary
+2.9.x
+Writes audit records to DB
+JSON log format
+Custom formatter
+Machine-readable logs for easy parsing
+Project Folder Structure (additions to Phase 8)
+backend/
+├── main.py                        # UPDATED — registers logging middleware
+├── routers/
+│   └── chat.py                    # UPDATED — calls logger at each pipeline step
+├── models/
+│   └── schemas.py
+├── logging_system/
+│   ├── __init__.py
+│   ├── logger_config.py           # NEW — configures Python logging
+│   ├── query_logger.py            # NEW — logs user queries and generated SQL
+│   ├── error_logger.py            # NEW — logs backend and execution errors
+│   ├── audit_logger.py            # NEW — logs sensitive operations
+│   └── ai_monitor.py             # NEW — tracks AI failures and hallucinations
+├── logs/
+│   ├── query.log                  # Auto-created at runtime
+│   ├── error.log
+│   ├── audit.log
+│   └── ai_monitor.log
+├── db/
+│   └── audit_db.py                # NEW (optional) — writes audit records to PostgreSQL
+└── ...
+Files — What Each File Does
+backend/logging_system/logger_config.py
+Configures all loggers at application startup. Each logger writes to its own rotating file AND to console (for development visibility).
+import logging
+import logging.handlers
+import json
+import os
+from datetime import datetime
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+class JSONFormatter(logging.Formatter):
+"""Outputs each log entry as a single JSON line for easy parsing."""
+def format(self, record):
+log_entry = {
+"timestamp": datetime.utcnow().isoformat() + "Z",
+"level": record.levelname,
+"logger": record.name,
+"message": record.getMessage(),
+}
+if hasattr(record, "extra"):
+log_entry.update(record.extra)
+return json.dumps(log_entry)
+def setup_logger(name: str, filename: str, level=logging.INFO) -> logging.Logger:
+logger = logging.getLogger(name)
+logger.setLevel(level)
+# Rotating file: max 5MB per file, keep 3 backups
+fh = logging.handlers.RotatingFileHandler(
+f"{LOG_DIR}/{filename}", maxBytes=5 * 1024 * 1024, backupCount=3
+)
+fh.setFormatter(JSONFormatter())
+logger.addHandler(fh)
+# Console handler for development
+ch = logging.StreamHandler()
+ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+logger.addHandler(ch)
+return logger
+# Create all loggers at module load
+query_logger  = setup_logger("query",    "query.log")
+error_logger  = setup_logger("error",    "error.log",  level=logging.ERROR)
+audit_logger  = setup_logger("audit",    "audit.log")
+ai_logger     = setup_logger("ai_monitor", "ai_monitor.log")
+backend/logging_system/query_logger.py
+Logs every query the user sends and what SQL was generated.
+from .logger_config import query_logger
+def log_query(session_id: str, user_message: str, generated_sql: str | None, status: str):
+"""
+status: 'success' | 'validation_blocked' | 'ai_failed' | 'execution_error'
+"""
+query_logger.info("query_event", extra={
+"session_id":     session_id,
+"user_message":   user_message,
+"generated_sql":  generated_sql,
+"status":         status,
+})
+Example log entry (JSON):
+{
+"timestamp": "2025-01-15T14:32:01Z",
+"level": "INFO",
+"logger": "query",
+"message": "query_event",
+"session_id": "abc-123",
+"user_message": "Show all employees",
+"generated_sql": "SELECT * FROM employees;",
+"status": "success"
+}
+backend/logging_system/error_logger.py
+Logs all application errors — backend exceptions, SQL execution failures, DB connection issues.
+from .logger_config import error_logger
+import traceback
+def log_error(error_type: str, message: str, detail: str = None, session_id: str = None):
+error_logger.error("error_event", extra={
+"error_type":  error_type,     # "sql_execution" | "db_connection" | "ai_api" | "validation"
+"message":     message,
+"detail":      detail,
+"session_id":  session_id,
+})
+def log_exception(exc: Exception, context: str, session_id: str = None):
+log_error(
+error_type=type(exc).__name__,
+message=str(exc),
+detail=traceback.format_exc(),
+session_id=session_id
+)
+backend/logging_system/audit_logger.py
+Logs sensitive data-modifying operations. Captures whether each was confirmed or blocked.
+from .logger_config import audit_logger
+def log_audit_event(
+session_id: str,
+operation: str,      # DELETE | UPDATE | DROP_ATTEMPT
+sql: str,
+outcome: str,        # 'confirmed_and_executed' | 'blocked' | 'cancelled_by_user'
+rows_affected: int = 0
+):
+audit_logger.warning("audit_event", extra={
+"session_id":    session_id,
+"operation":     operation,
+"sql":           sql,
+"outcome":       outcome,
+"rows_affected": rows_affected,
+})
+Example audit log:
+{
+"timestamp": "2025-01-15T14:45:22Z",
+"level":     "WARNING",
+"logger":    "audit",
+"message":   "audit_event",
+"session_id":"abc-123",
+"operation": "DELETE",
+"sql":       "DELETE FROM employees WHERE id = 5;",
+"outcome":   "confirmed_and_executed",
+"rows_affected": 1
+}
+backend/logging_system/ai_monitor.py
+Tracks AI behaviour: hallucinations (referencing invalid schema), generation failures, and unexpected outputs.
+from .logger_config import ai_logger
+def log_ai_success(session_id: str, prompt_length: int, generated_sql: str):
+ai_logger.info("ai_success", extra={
+"session_id":    session_id,
+"prompt_length": prompt_length,
+"generated_sql": generated_sql,
+})
+def log_ai_failure(session_id: str, reason: str, raw_response: str = None):
+"""reason: 'cannot_generate' | 'hallucinated_table' | 'hallucinated_column' | 'invalid_format'"""
+ai_logger.warning("ai_failure", extra={
+"session_id":   session_id,
+"reason":       reason,
+"raw_response": raw_response,
+})
+def log_ai_api_error(session_id: str, error: str):
+ai_logger.error("ai_api_error", extra={
+"session_id": session_id,
+"error":      error,
+})
+backend/main.py (updated — HTTP access logging middleware)
+import time
+from fastapi import Request
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+start = time.time()
+response = await call_next(request)
+duration_ms = round((time.time() - start) * 1000, 2)
+query_logger.info("http_request", extra={
+"method":      request.method,
+"path":        request.url.path,
+"status_code": response.status_code,
+"duration_ms": duration_ms,
+})
+return response
+backend/routers/chat.py (updated — logging at each step)
+from logging_system.query_logger import log_query
+from logging_system.error_logger import log_exception
+from logging_system.audit_logger import log_audit_event
+from logging_system.ai_monitor import log_ai_success, log_ai_failure
+@router.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+session_id = request.session_id or str(uuid.uuid4())
+try:
+# ... Phase 7 routing ...
+# ... Phase 3 SQL generation ...
+if sql is None:
+log_ai_failure(session_id, reason="cannot_generate", raw_response=raw)
+log_query(session_id, request.message, None, "ai_failed")
+return ChatResponse(reply="Could not generate SQL.", session_id=session_id)
+log_ai_success(session_id, len(prompt), sql)
+# ... Phase 4 validation ...
+if not validation.passed:
+if "DROP" in sql.upper() or "TRUNCATE" in sql.upper():
+log_audit_event(session_id, "DROP_ATTEMPT", sql, "blocked")
+log_query(session_id, request.message, sql, "validation_blocked")
+return ChatResponse(reply=f"Blocked: {validation.error_message}", sql=sql)
+if validation.requires_confirmation:
+log_query(session_id, request.message, sql, "awaiting_confirmation")
+return ChatResponse(reply="Confirm to proceed.", sql=sql, requires_confirmation=True)
+# ... Phase 5 execution ...
+result = execute_query(sql, dbname)
+if not result.success:
+log_query(session_id, request.message, sql, "execution_error")
+log_error("sql_execution", result.message, session_id=session_id)
+else:
+log_query(session_id, request.message, sql, "success")
+op = result.operation
+if op in ("DELETE", "UPDATE"):
+log_audit_event(session_id, op, sql, "confirmed_and_executed", result.row_count)
+return ChatResponse(reply=result.message, sql=sql, execution=result, session_id=session_id)
+except Exception as e:
+log_exception(e, "chat_endpoint", session_id)
+raise
+backend/db/audit_db.py (optional persistent audit log)
+For production environments, writes audit events to a dedicated audit_log PostgreSQL table.
+CREATE TABLE audit_log (
+id          SERIAL PRIMARY KEY,
+session_id  VARCHAR(64),
+operation   VARCHAR(20),
+sql_text    TEXT,
+outcome     VARCHAR(30),
+rows_affected INT,
+created_at  TIMESTAMP DEFAULT NOW()
+);
+def write_audit_to_db(session_id, operation, sql, outcome, rows_affected):
+conn = get_connection("audit_db")   # Dedicated audit database
+# INSERT into audit_log ...
+File-based logs are the primary system. Database logs are optional for persistence across restarts.
+How Files Interact
+Every chat request flows through chat.py which calls:
+├── query_logger.log_query()           ← always, at start and end
+├── ai_monitor.log_ai_success/failure() ← after Gemini responds
+├── audit_logger.log_audit_event()     ← for DELETE/UPDATE/DROP
+└── error_logger.log_exception()       ← on any uncaught exception
+HTTP middleware in main.py logs:
+└── every request: method, path, status code, duration
+All log functions are fire-and-forget:
+└── logging failures do NOT raise exceptions
+└── wrapped in try/except internally to never crash the app
+Log Files Overview
+File
+Contains
+Rotation
+logs/query.log
+All user queries, generated SQL, statuses
+5MB × 3
+logs/error.log
+All exceptions and execution errors
+5MB × 3
+logs/audit.log
+DELETE, UPDATE, DROP attempts and outcomes
+5MB × 3
+logs/ai_monitor.log
+AI successes, failures, hallucination events
+5MB × 3
+Implementation Steps
+Step 1 — Logging System Setup
+Create logging_system/ directory
+Write logger_config.py with JSON formatter and rotating handlers
+Create logs/ directory (add to .gitignore)
+Step 2 — Query Logging
+Implement query_logger.py
+Call log_query at start and end of chat.py pipeline
+Step 3 — Error Logging
+Implement error_logger.py
+Wrap chat.py main logic in try/except and call log_exception
+Step 4 — Audit Logging
+Implement audit_logger.py
+Log all DELETE, UPDATE outcomes in execute-confirmed endpoint too
+Step 5 — AI Monitoring
+Implement ai_monitor.py
+Log hallucinations detected by schema_checker (invalid table → log as hallucination)
+Log every CANNOT_GENERATE response
+Error Handling Plan
+Scenario
+Handling
+Log file write fails (disk full)
+Logging exception silently caught; main app continues
+Log directory missing at startup
+os.makedirs(LOG_DIR, exist_ok=True) in logger_config.py
+Log record missing field
+Extra fields are optional; missing ones simply absent from JSON
+Concurrent writes to log file
+Python's logging module is thread-safe by default
+Expected Output at End of Phase 9
+Every user query produces a JSON log entry in query.log
+Every AI-generated SQL (success or failure) is logged in ai_monitor.log
+Every DELETE/UPDATE is logged in audit.log regardless of outcome
+All uncaught exceptions are captured in error.log with stack traces
+Logging failures never interrupt normal application operation
+What Is NOT in This Phase
+Log viewer UI (Phase 10 Advanced Features, optional)
+Centralised log aggregation (ELK, Datadog — production-only)
+Export functionality (Phase 10)
+Deployment (Phase 11)
+ADDITIONAL MODIFICATION — DATABASE & TABLE MANAGEMENT LOGGING
+Extend logging and monitoring system to track PostgreSQL schema management operations.
+NEW LOGGING CAPABILITIES:
+database creation logs
+table creation logs
+schema modification logs
+database selection logs
+Audit Logging
+Track:
+CREATE DATABASE
+CREATE TABLE
+database selection
+table selection
+schema validation failures
+Add New Audit Events
+Add event types:
+CREATE_DATABASE
+CREATE_TABLE
+DATABASE_SWITCH
+TABLE_SWITCH
+SCHEMA_REFRESH
+Query Logging Updates
+Log:
+selected database
+selected table
+AI-generated CREATE statements
+metadata refresh events
+AI Monitoring Updates
+Track:
+hallucinated database names
+hallucinated table names
+invalid schema generation
+invalid PostgreSQL types
+Error Logging
+Handle:
+duplicate database errors
+duplicate table errors
+invalid schema errors
+PostgreSQL permission failures
+failed schema refresh operations
+Metadata Refresh Logs
+Whenever:
+DB created
+table created
+log:
+refresh start
+refresh completion
+refresh failures
+Security Logging
+Track:
+blocked CREATE attempts
+blocked malicious identifiers
+SQL injection attempts
+invalid schema requests
+Structured JSON Logs
+All new schema operations must be logged in structured JSON format.
+
+
+================================================================================
+PHASE 10
+================================================================================
+
+Phase 10 — Advanced Features & System Enhancement
+Goal
+Enhance the fully-functional AI SQL assistant with advanced capabilities: data export, AI-generated reports, an analytics dashboard, support for complex SQL queries, improved UI/UX, and overall performance optimisation.
+Technologies Used
+Technology
+Version / Notes
+Why It Is Used
+React
+18.x
+Advanced frontend components
+Recharts
+2.x
+Data visualisation charts in React
+Papa Parse
+5.x
+Client-side CSV generation
+SheetJS (xlsx)
+0.18.x
+Client-side Excel file generation
+jsPDF
+2.x
+Client-side PDF generation
+Tailwind CSS
+3.x
+Enhanced UI layouts
+FastAPI
+0.110.x
+Advanced backend endpoints
+Gemini API
+gemini-1.5-flash
+AI report and summary generation
+Python functools.lru_cache
+Built-in
+Schema metadata caching
+Project Folder Structure (additions to Phase 9)
+frontend/src/
+├── components/
+│   ├── ResultsTable.jsx            # UPDATED — add pagination, sorting, column filter
+│   ├── AnalyticsDashboard.jsx      # NEW — charts and stats panel
+│   ├── ExportBar.jsx               # NEW — CSV / Excel / PDF export buttons
+│   ├── ReportViewer.jsx            # NEW — displays AI-generated Markdown report
+│   └── DatabaseSelector.jsx        # NEW — manual DB override dropdown
+├── hooks/
+│   └── useExport.js                # NEW — export logic (CSV, Excel, PDF)
+└── services/
+└── api.js                      # UPDATED — report and analytics endpoints
+backend/
+├── routers/
+│   ├── chat.py
+│   ├── schema.py
+│   ├── analytics.py               # NEW — /api/analytics endpoints
+│   └── export.py                  # NEW — /api/export endpoints (server-side fallback)
+├── ai/
+│   └── report_generator.py        # NEW — structured AI report via Gemini
+└── db/
+└── analytics_queries.py       # NEW — pre-built analytical SQL
+Feature 1 — Export System
+Frontend: src/hooks/useExport.js
+Handles client-side generation of CSV, Excel, and PDF from the current query results. No backend round-trip needed for most exports.
+import Papa from 'papaparse'
+import * as XLSX from 'xlsx'
+export function useExport(columns, rows) {
+function exportCSV(filename = "results.csv") {
+const data = rows.map(row =>
+Object.fromEntries(columns.map((col, i) => [col, row[i]]))
+)
+const csv = Papa.unparse(data)
+downloadBlob(csv, filename, "text/csv")
+}
+function exportExcel(filename = "results.xlsx") {
+const data = [columns, ...rows]
+const ws = XLSX.utils.aoa_to_sheet(data)
+const wb = XLSX.utils.book_new()
+XLSX.utils.book_append_sheet(wb, ws, "Results")
+XLSX.writeFile(wb, filename)
+}
+async function exportPDF(filename = "results.pdf") {
+const { jsPDF } = await import("jspdf")
+const { autoTable } = await import("jspdf-autotable")
+const doc = new jsPDF()
+autoTable(doc, { head: [columns], body: rows })
+doc.save(filename)
+}
+function downloadBlob(content, filename, type) {
+const blob = new Blob([content], { type })
+const url = URL.createObjectURL(blob)
+const a = document.createElement("a")
+a.href = url; a.download = filename; a.click()
+URL.revokeObjectURL(url)
+}
+return { exportCSV, exportExcel, exportPDF }
+}
+Frontend: src/components/ExportBar.jsx
+function ExportBar({ columns, rows }) {
+const { exportCSV, exportExcel, exportPDF } = useExport(columns, rows)
+if (!rows?.length) return null
+return (
+<div className="flex gap-2 mt-2">
+<button onClick={exportCSV}   className="export-btn">⬇ CSV</button>
+<button onClick={exportExcel} className="export-btn">⬇ Excel</button>
+<button onClick={exportPDF}   className="export-btn">⬇ PDF</button>
+</div>
+)
+}
+ExportBar is rendered inside MessageBubble below ResultsTable when execution.operation === "SELECT".
+Feature 2 — AI Report Generation
+Backend: backend/ai/report_generator.py
+Uses Gemini to produce a structured Markdown report from query results.
+import json
+REPORT_PROMPT_TEMPLATE = """
+You are a data analyst. Given the following database query results, write a professional report.
+Context: {context}
+Data:
+{data}
+Write a report with:
+- A brief executive summary (2-3 sentences)
+- Key findings as bullet points
+- Any notable patterns or outliers
+- A conclusion
+Format in Markdown. Keep it concise and professional.
+"""
+def generate_report(data: dict, context: str) -> str:
+data_str = json.dumps({"columns": data["columns"], "rows": data["rows"][:100]}, indent=2)
+prompt = REPORT_PROMPT_TEMPLATE.format(context=context, data=data_str)
+response = model.generate_content(prompt)
+return response.text
+Frontend: src/components/ReportViewer.jsx
+Renders the Markdown report using a lightweight Markdown renderer.
+import ReactMarkdown from 'react-markdown'
+function ReportViewer({ markdown }) {
+return (
+<div className="prose prose-sm max-w-none mt-3 p-3 bg-gray-50 rounded border">
+<ReactMarkdown>{markdown}</ReactMarkdown>
+</div>
+)
+}
+Users trigger report generation by clicking "Generate Report" below query results. This calls POST /api/report with the current result data.
+Feature 3 — Analytics Dashboard
+Frontend: src/components/AnalyticsDashboard.jsx
+A side panel (or tab) showing aggregated statistics about recent queries and DB activity.
+Stats displayed:
+Queries run this session (count)
+Most queried table
+Query type breakdown: SELECT vs INSERT vs UPDATE vs DELETE (pie chart)
+Average result size (row count per SELECT)
+import { PieChart, Pie, Cell, Tooltip, BarChart, Bar, XAxis, YAxis } from 'recharts'
+function AnalyticsDashboard({ queryHistory }) {
+const typeCounts = countByType(queryHistory)
+const COLORS = ["#3B82F6", "#10B981", "#F59E0B", "#EF4444"]
+return (
+<div className="p-4 bg-white rounded shadow">
+<h3 className="font-semibold text-gray-700 mb-3">Session Analytics</h3>
+<p>Total queries: {queryHistory.length}</p>
+<PieChart width={200} height={200}>
+<Pie data={typeCounts} cx={100} cy={100} outerRadius={80} dataKey="value">
+{typeCounts.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+</Pie>
+<Tooltip />
+</PieChart>
+</div>
+)
+}
+queryHistory is maintained in App.jsx state and updated after each successful query execution.
+Backend analytics endpoints: backend/routers/analytics.py
+Pre-built analytical queries for common database statistics.
+@router.get("/analytics/table-stats")
+async def table_stats():
+"""Returns row counts for all tables in the selected database."""
+schema = get_metadata()["schema"]
+dbname = get_metadata()["selected_db"]
+results = {}
+for table in schema.keys():
+result = execute_query(f"SELECT COUNT(*) FROM {table};", dbname)
+if result.success:
+results[table] = result.rows[0][0]
+return {"table_stats": results}
+Feature 4 — Enhanced Results Table
+Updated ResultsTable.jsx
+New capabilities:
+Pagination: show 20 rows per page, with next/previous buttons
+Column sorting: click column header to sort ascending/descending
+Column search: filter visible rows by typing in a column
+function ResultsTable({ columns, rows }) {
+const [page, setPage] = useState(0)
+const [sortCol, setSortCol] = useState(null)
+const [sortDir, setSortDir] = useState("asc")
+const PAGE_SIZE = 20
+const sorted = sortCol
+? [...rows].sort((a, b) => {
+const i = columns.indexOf(sortCol)
+return sortDir === "asc"
+? String(a[i]).localeCompare(String(b[i]))
+: String(b[i]).localeCompare(String(a[i]))
+})
+: rows
+const paged = sorted.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+const totalPages = Math.ceil(rows.length / PAGE_SIZE)
+return (
+<div>
+<table>
+<thead>
+<tr>
+{columns.map(col => (
+<th key={col} onClick={() => handleSort(col)} className="cursor-pointer">
+{col} {sortCol === col ? (sortDir === "asc" ? "↑" : "↓") : ""}
+</th>
+))}
+</tr>
+</thead>
+<tbody>
+{paged.map((row, i) => <tr key={i}>{row.map((cell, j) => <td key={j}>{cell}</td>)}</tr>)}
+</tbody>
+</table>
+<div className="pagination">
+<button disabled={page === 0} onClick={() => setPage(p => p - 1)}>← Prev</button>
+<span>Page {page + 1} of {totalPages}</span>
+<button disabled={page >= totalPages - 1} onClick={() => setPage(p => p + 1)}>Next →</button>
+</div>
+</div>
+)
+}
+Feature 5 — Advanced SQL Query Support
+The prompt in prompt_builder.py is enhanced to guide Gemini toward generating more complex queries.
+ADVANCED_SQL_INSTRUCTIONS = """
+Additional SQL capabilities you can use:
+- JOINs: INNER JOIN, LEFT JOIN, RIGHT JOIN
+- Aggregations: COUNT(), SUM(), AVG(), MIN(), MAX() with GROUP BY
+- Subqueries: SELECT ... WHERE column IN (SELECT ...)
+- HAVING clauses for post-aggregation filtering
+- ORDER BY with ASC/DESC
+- LIMIT for top-N queries
+- Common Table Expressions (CTEs): WITH cte AS (...)
+"""
+This is appended to the base system instructions.
+Feature 6 — Performance Optimisation
+Schema Metadata Caching
+Add @functools.lru_cache to format_schema_for_prompt so the formatted string is not recomputed on every request.
+import functools
+@functools.lru_cache(maxsize=32)
+def format_schema_for_prompt(schema_tuple: tuple) -> str:
+# schema must be converted to a hashable tuple before calling
+schema = dict(schema_tuple)
+# ... format logic
+Prompt Length Optimisation
+For large schemas (many tables), include only the top 10 most relevant tables based on keyword matching with the user question:
+def filter_schema_by_relevance(schema: dict, question: str, max_tables: int = 10) -> dict:
+question_words = set(question.lower().split())
+scored = {
+table: sum(1 for col in cols if col.lower() in question_words or table.lower() in question_words)
+for table, cols in schema.items()
+}
+top_tables = sorted(scored, key=scored.get, reverse=True)[:max_tables]
+return {t: schema[t] for t in top_tables}
+Response Streaming (Optional)
+For long AI responses (reports, summaries), FastAPI can stream the Gemini response using StreamingResponse:
+from fastapi.responses import StreamingResponse
+@router.post("/report/stream")
+async def stream_report(request: ReportRequest):
+async def generate():
+for chunk in model.generate_content(prompt, stream=True):
+yield chunk.text
+return StreamingResponse(generate(), media_type="text/plain")
+How Features Interact
+User runs: "Show all employees"
+→ ResultsTable shows paginated, sortable results
+→ ExportBar shows CSV / Excel / PDF buttons
+→ "Generate Report" button appears below table
+→ User clicks "Generate Report"
+→ POST /api/report with result data
+→ Gemini generates Markdown report
+→ ReportViewer renders report below table
+→ AnalyticsDashboard updates with query count
+Implementation Steps
+Step 1 — Dashboard Development
+Build AnalyticsDashboard.jsx with Recharts
+Add query history tracking in App.jsx
+Step 2 — Export System
+Implement useExport.js hook
+Build ExportBar.jsx and add to MessageBubble
+Test CSV, Excel, PDF generation in browser
+Step 3 — Report Generation
+Write report_generator.py backend module
+Add POST /api/report endpoint
+Build ReportViewer.jsx frontend component
+Step 4 — Advanced Query Support
+Extend prompt_builder.py with advanced SQL instructions
+Test complex JOIN and aggregation queries
+Step 5 — Performance Optimisation
+Add schema caching
+Add relevance-based schema filtering
+Profile API response times and identify bottlenecks
+Error Handling Plan
+Scenario
+Handling
+Export fails (browser blocks download)
+Show error notification: "Download blocked, try again"
+Report generation too slow
+Add loading indicator, streaming response for long reports
+Large result set (10k+ rows)
+Pagination caps display at 20/page; export still exports all
+Chart library fails to render
+Fallback to plain text summary
+Advanced SQL query times out
+psycopg2 cursor.execute with timeout parameter
+Expected Output at End of Phase 10
+SELECT results have pagination, sorting, and column controls
+CSV, Excel, PDF export works in the browser
+"Generate Report" produces a readable Markdown report in the chat
+Analytics dashboard shows query type breakdown for the session
+Complex JOIN, GROUP BY, and CTE queries are generated and executed correctly
+Schema caching reduces repeated formatting overhead
+What Is NOT in This Phase
+Full deployment to production (Phase 11)
+End-to-end testing suite (Phase 11)
+Docker containerisation (Phase 11)
+ADDITIONAL MODIFICATION — ADVANCED POSTGRESQL MANAGEMENT FEATURES
+Extend advanced system features to support full PostgreSQL management workflows.
+NEW ADVANCED CAPABILITIES:
+schema visualization
+live database refresh
+live table refresh
+AI schema suggestions
+advanced PostgreSQL management UI
+Schema Visualizer
+Add visual schema explorer:
+Database↓Tables↓Columns
+Display:
+database names
+table names
+column names
+PostgreSQL types
+Live Schema Refresh
+Automatically refresh frontend when:
+database created
+table created
+schema changes occur
+AI Schema Suggestions
+Support prompts like:
+"Suggest tables for HR system"
+"Create recommended schema for inventory management"
+AI should generate:
+recommended tables
+columns
+PostgreSQL types
+Advanced Table Creation Wizard
+Enhance create table UI:
+drag/drop columns
+column validation
+type recommendations
+preview generated SQL
+Analytics Dashboard Updates
+Track:
+most used databases
+most queried tables
+schema growth statistics
+query distribution by database
+Export System Updates
+Allow exporting:
+schema metadata
+table definitions
+database summaries
+AI Report Generation Updates
+Generate reports about:
+schema structure
+database usage
+table statistics
+database activity
+Performance Optimizations
+Optimize:
+schema caching
+metadata refresh
+database switching
+table discovery
+UI Enhancements
+Add:
+live refresh indicators
+schema explorer sidebar
+database activity panel
+schema health indicators
+Future Scalability Preparation
+Prepare architecture for:
+multi-user support
+organization workspaces
+role-based permissions
+database ownership management
+
