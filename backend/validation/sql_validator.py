@@ -31,6 +31,7 @@ from typing import Optional
 from validation.safety_checker import check_safety
 from validation.schema_checker import check_schema
 from validation.schema_creator_validator import check_creator_sql
+from utils.logging_config import logger_audit
 
 # Intents that bypass validation entirely
 _SKIP_INTENTS: set[str] = {"NEEDS_CLARIFICATION", "UNKNOWN"}
@@ -90,6 +91,21 @@ def validate(intent: str, sql: Optional[str], schema: dict) -> dict:
         print(f"  [X] BLOCKED PATTERN DETECTED")
         print(f"  Reason: {blocked_reason}\n")
         _log_footer_blocked(blocked_reason)
+        try:
+            logger_audit.warning(
+                f"SQL query blocked by safety gate: {blocked_reason}",
+                extra={
+                    "category": "audit",
+                    "operation_type": "SECURITY_CHECK",
+                    "intent": intent,
+                    "sql": sql,
+                    "risk_level": "BLOCKED",
+                    "blocked_reason": blocked_reason,
+                    "success": False
+                }
+            )
+        except Exception:
+            pass
         return {
             "valid": False,
             "risk_level": "BLOCKED",
@@ -109,6 +125,21 @@ def validate(intent: str, sql: Optional[str], schema: dict) -> dict:
         reason = schema_result["reason"]
         print(f"  [X] FAILED: {reason}\n")
         _log_footer_failed(risk_level, reason)
+        try:
+            logger_audit.warning(
+                f"SQL schema validation failed: {reason}",
+                extra={
+                    "category": "audit",
+                    "operation_type": "SCHEMA_VALIDATION",
+                    "intent": intent,
+                    "sql": sql,
+                    "risk_level": risk_level,
+                    "failure_reason": reason,
+                    "success": False
+                }
+            )
+        except Exception:
+            pass
         return {
             "valid": False,
             "risk_level": risk_level,
@@ -127,6 +158,21 @@ def validate(intent: str, sql: Optional[str], schema: dict) -> dict:
         reason = creator_result["reason"]
         print(f"  [X] FAILED: {reason}\n")
         _log_footer_failed(risk_level, reason)
+        try:
+            logger_audit.warning(
+                f"SQL creator validation failed: {reason}",
+                extra={
+                    "category": "audit",
+                    "operation_type": "CREATOR_VALIDATION",
+                    "intent": intent,
+                    "sql": sql,
+                    "risk_level": risk_level,
+                    "failure_reason": reason,
+                    "success": False
+                }
+            )
+        except Exception:
+            pass
         return {
             "valid": False,
             "risk_level": risk_level,
@@ -140,6 +186,22 @@ def validate(intent: str, sql: Optional[str], schema: dict) -> dict:
     # ── Assemble final passing result ─────────────────────────────────────────
     requires_confirmation = risk_level in _CONFIRMATION_REQUIRED
     _log_footer_pass(risk_level, requires_confirmation)
+
+    try:
+        logger_audit.info(
+            f"SQL validation passed (risk level: {risk_level})",
+            extra={
+                "category": "audit",
+                "operation_type": "VALIDATION_PASS",
+                "intent": intent,
+                "sql": sql,
+                "risk_level": risk_level,
+                "requires_confirmation": requires_confirmation,
+                "success": True
+            }
+        )
+    except Exception:
+        pass
 
     return {
         "valid": True,
@@ -176,7 +238,7 @@ def _log_skip(intent: str) -> None:
 
 def _log_no_sql(intent: str) -> None:
     print(f"Intent:\n{intent}\n")
-    print("  → No SQL generated. Passing through as SAFE.")
+    print("  -> No SQL generated. Passing through as SAFE.")
     print("\n====================================\n")
 
 

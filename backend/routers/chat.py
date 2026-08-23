@@ -1,16 +1,25 @@
 import os
 import re
 import time
-from typing import Optional
-from fastapi import APIRouter, HTTPException
+from typing import Optional, Any
+from fastapi import APIRouter, HTTPException, Depends
 from models.schemas import ChatRequest, ChatResponse, ExecuteConfirmedRequest
 from state.metadata_store import get_metadata, refresh_routing_summaries  # Phase 7
 from state.session_store import get_session, update_session, log_session_state  # Phase 6
-from ai.router_service import route_to_database  # Phase 7
 from validation.sql_validator import validate as validate_sql
 from db.executor import execute_sql  # Phase 5 Executor (kept for /execute-confirmed)
+from utils.config_loader import get_superdb_name
 from agent import gemini_metrics  # Phase 8.5: Gemini call instrumentation
-from agent.agent_coordinator import _deterministic_dispatch  # Phase 4.5 Finding 3
+from agent.typo_intent_layer import process as _typo_intent_process  # Phase 1: Typo & Intent Layer
+from auth.dependencies import get_current_user
+from utils.logging_config import (
+    session_id_var,
+    user_id_var,
+    database_name_var,
+    selected_table_var,
+    metadata_version_var,
+    logger_audit
+)
 
 router = APIRouter()
 
@@ -43,109 +52,153 @@ def _extract_explicit_db(
     return None
 
 
-_NEW_COMMAND_PATTERN = re.compile(
-    r"^\s*(show|list|display|find|count|search|get|use|switch|select|insert|update|delete|create|alter|drop|truncate|describe|explain|generate\s+report|format)\b",
+def _process_sql_execution_result(
+    agent_result: dict,
+    session: dict,
+    session_id: str,
+    classification: dict,
+    selected_pipeline_name: str,
+    execution_path: str,
+    target_db: str
+) -> Optional[Any]:
+    execution = agent_result.get("execution")
+    if not (execution and isinstance(execution, dict) and execution.get("success")):
+        return None
+        
+    # Check cache first if agent_result indicates cached run
+    if agent_result.get("cached"):
+        from analytics import AnalyticsEngine
+        cached = AnalyticsEngine.get_cached_result(session_id)
+        if cached:
+            print("[Result Processor] Reusing cached ProcessedResult object.")
+            return cached
+        
+    from agent.result_processing import ResultProcessor
+    
+    # Process result
+    processed_result = ResultProcessor.process(
+        columns=execution.get("columns", []),
+        rows=execution.get("rows", []),
+        sql=agent_result.get("sql") or execution.get("sql"),
+        dbname=agent_result.get("database") or target_db,
+        classification=classification.get("category"),
+        selected_pipeline=selected_pipeline_name,
+        execution_path=execution_path,
+        column_types=execution.get("column_types")
+    )
+    
+    # 1. Human-Readable Console Output (Uvicorn Logs)
+    print("\n====================================")
+    print("RESULT PROCESSOR")
+    print("====================================")
+    print("Dataset Profile Started")
+    for step_name, step_ms in processed_result.processing.step_durations.items():
+        print(f"  {step_name:<28} {step_ms:.2f} ms")
+    print(f"Result Processor Completed:   {processed_result.processing.processing_time_ms:.2f} ms")
+    
+    print("\nDataset Summary:")
+    print(f"  Rows:                       {processed_result.execution.row_count}")
+    print(f"  Columns:                    {processed_result.execution.column_count}")
+    
+    num_cols = ", ".join(processed_result.semantics.numeric_columns)
+    print(f"  Numeric Columns:            {num_cols if num_cols else 'None'}")
+    
+    cat_cols = ", ".join(processed_result.semantics.categorical_columns)
+    print(f"  Categorical Columns:        {cat_cols if cat_cols else 'None'}")
+    
+    dt_cols = ", ".join(processed_result.semantics.datetime_columns)
+    print(f"  Datetime Columns:           {dt_cols if dt_cols else 'None'}")
+    
+    bool_cols = ", ".join(processed_result.semantics.boolean_columns)
+    print(f"  Boolean Columns:            {bool_cols if bool_cols else 'None'}")
+    
+    # Memory formatting
+    mem = processed_result.processing.memory_usage_bytes
+    if mem < 1024:
+        mem_str = f"{mem} B"
+    elif mem < 1024 * 1024:
+        mem_str = f"{mem / 1024:.2f} KB"
+    else:
+        mem_str = f"{mem / (1024 * 1024):.2f} MB"
+    print(f"  Memory Usage:               {mem_str}")
+    print("====================================\n")
+    
+    # 2. Structured JSON Log (logs/app.log)
+    from utils.logging_config import logger_query
+    try:
+        logger_query.info(
+            "SQL result processing completed",
+            extra={
+                "category": "query",
+                "operation_type": "RESULT_PROCESSING",
+                "database_name": processed_result.execution.database_name,
+                "dataframe_rows": processed_result.execution.row_count,
+                "dataframe_columns": processed_result.execution.column_count,
+                "numeric_columns": processed_result.semantics.numeric_columns,
+                "categorical_columns": processed_result.semantics.categorical_columns,
+                "datetime_columns": processed_result.semantics.datetime_columns,
+                "boolean_columns": processed_result.semantics.boolean_columns,
+                "statistics_status": processed_result.statistics.status,
+                "processing_time_ms": processed_result.processing.processing_time_ms,
+                "rows": processed_result.execution.row_count,
+                "columns": processed_result.execution.column_count,
+                "dataset_empty": processed_result.profile.dataset_empty,
+                "numeric_column_count": processed_result.profile.numeric_column_count,
+                "categorical_column_count": processed_result.profile.categorical_column_count,
+                "statistics_generated": processed_result.statistics.status in {"IMMEDIATE", "COMPUTED"},
+                "memory_usage_bytes": processed_result.processing.memory_usage_bytes,
+                "warnings": processed_result.processing.warnings
+            }
+        )
+    except Exception:
+        pass
+        
+    # 3. Save lightweight metadata in session memory
+    session["last_dataset_metadata"] = {
+        "columns": processed_result.dataset.columns,
+        "row_count": processed_result.execution.row_count,
+        "numeric_columns": processed_result.semantics.numeric_columns,
+        "categorical_columns": processed_result.semantics.categorical_columns,
+        "datetime_columns": processed_result.semantics.datetime_columns,
+        "boolean_columns": processed_result.semantics.boolean_columns,
+        "timestamp": time.time()
+    }
+    
+    # Cache the source result if it's an unaggregated SELECT query
+    from analytics.engine import AnalyticsEngine
+    from analytics.helpers import is_unaggregated_select, extract_tables_from_select, get_sql_fingerprint
+    
+    sql_str = processed_result.execution.sql or ""
+    if sql_str and is_unaggregated_select(sql_str):
+        source_tables = extract_tables_from_select(sql_str)
+        exec_mode = agent_result.get("execution_mode", "STANDARD_SQL")
+        db_name = processed_result.execution.database_name or target_db
+        fingerprint = get_sql_fingerprint(sql_str)
+        
+        AnalyticsEngine.cache_source(
+            session_id=session_id,
+            result=processed_result,
+            source_tables=source_tables,
+            db_name=db_name,
+            sql_fingerprint=fingerprint,
+            execution_mode=exec_mode
+        )
+    
+    return processed_result
+
+
+
+_QUESTION_INTERRUPTION_PATTERN = re.compile(
+    r"^\s*(what|where|how|why|which|in\s+which|is|are|can|could|would|will|does|do)\b",
     re.IGNORECASE
 )
 
-
-def is_new_command_detected(message: str) -> bool:
-    """
-    Detect if the user message matches a brand new command prefix.
-    If so, we discard any pending clarification context.
-    """
-    return bool(_NEW_COMMAND_PATTERN.match(message))
-
-
-_VALID_DATATYPES = {
-    "int", "integer", "serial", "text", "varchar", "char", "numeric",
-    "decimal", "float", "double", "real", "boolean", "bool", "date",
-    "time", "timestamp", "json", "uuid",
-    "bigint", "smallint", "jsonb", "bytea", "timestamptz", "character varying", "character",
-    "double precision"
-}
-
-_CONSTRAINT_KEYWORDS = {"primary", "foreign", "unique", "check", "constraint"}
-
-
-_FORBIDDEN_COLUMN_NAMES = {
-    "show", "list", "display", "find", "count", "search", "get", "use",
-    "switch", "select", "insert", "update", "delete", "create", "alter",
-    "drop", "truncate", "describe", "explain", "generate", "format"
-}
-
-
-def split_column_definitions(message: str) -> list[str]:
-    """
-    Split a column definition list by commas, but ignoring commas inside parentheses.
-    E.g., "price NUMERIC(10,2), name TEXT" -> ["price NUMERIC(10,2)", "name TEXT"]
-    """
-    parts = []
-    current = []
-    paren_depth = 0
-    for char in message:
-        if char == '(':
-            paren_depth += 1
-        elif char == ')':
-            paren_depth -= 1
-        
-        if char == ',' and paren_depth == 0:
-            parts.append("".join(current).strip())
-            current = []
-        else:
-            current.append(char)
-            
-    if current:
-        parts.append("".join(current).strip())
-        
-    return [p for p in parts if p]
-
-
-def is_valid_column_definition(message: str) -> bool:
-    """
-    Validate if the message looks like a valid Postgres column definition list
-    (e.g., "id INTEGER, name VARCHAR(100) NOT NULL" or just "name TEXT").
-    """
-    parts = split_column_definitions(message)
-    if not parts:
-        return False
-
-    for part in parts:
-        tokens = part.split()
-        if not tokens:
-            continue
-
-        # If it's a composite constraint, skip column-specific validation
-        first_token = tokens[0].lower()
-        is_constraint = False
-        for kw in _CONSTRAINT_KEYWORDS:
-            if first_token == kw or first_token.startswith(kw + "("):
-                is_constraint = True
-                break
-        if is_constraint:
-            continue
-
-        if len(tokens) < 2:
-            return False
-
-        col_name = tokens[0].lower()
-        if col_name in _FORBIDDEN_COLUMN_NAMES:
-            return False
-
-        datatype = tokens[1].lower()
-        # Handle multi-word type "character varying"
-        if datatype == "character" and len(tokens) >= 3 and (tokens[2].lower() == "varying" or tokens[2].lower().startswith("varying(")):
-            datatype_clean = "character varying"
-        # Handle multi-word type "double precision"
-        elif datatype == "double" and len(tokens) >= 3 and tokens[2].lower().startswith("precision"):
-            datatype_clean = "double precision"
-        else:
-            datatype_clean = re.sub(r"\(.*?\)", "", tokens[1]).strip().lower()
-        
-        if datatype_clean not in _VALID_DATATYPES:
-            return False
-
-    return True
+# ─── Shared pending-clarification helpers (Stage 3: shared module) ────────────
+from agent.pending_resolution import (  # noqa: E402
+    is_new_command_detected,
+    split_column_definitions,
+    is_valid_column_definition,
+)
 
 
 # ─── Helpers (unchanged from Phase 5 / Phase 6) ──────────────────────────────
@@ -219,725 +272,669 @@ def _update_session_from_execution(
             from state.session_store import rename_session_table
             rename_session_table(session_id, old_table, new_table)
 
+    # Handle DROP DATABASE session cleanup
+    from db.executor import _clean_sql
+    cleaned_sql = _clean_sql(sql)
+    is_drop_db = (
+        op == "DROP DATABASE"
+        or (op == "DROP" and "DATABASE" in cleaned_sql.upper())
+    )
+    if is_drop_db:
+        match = re.search(r"DROP\s+DATABASE\s+(?:IF\s+EXISTS\s+)?([a-zA-Z0-9_\"'`]+)", cleaned_sql, re.IGNORECASE)
+        if match:
+            dropped_db = match.group(1).strip('`"\'')
+            meta = get_metadata()
+            routing_summaries = meta.get("routing_summaries", {})
+            db_tables = []
+            for d_name, t_names in routing_summaries.items():
+                if d_name.lower() == dropped_db.lower():
+                    db_tables = t_names
+                    break
+            from state.session_store import clear_session_database
+            clear_session_database(session_id, dropped_db, db_tables)
+
 
 # ─── Phase 8: /chat endpoint ─────────────────────────────────────────────────
 
 
-def _print_clarification_trace(
-    clarification_type: str,
-    original_request: str,
-    options: list,
-    selected_option: str,
-    reconstructed_request: str,
-    override_target_db: str,
-) -> None:
-    """Print a structured clarification resolution trace block. No side effects."""
-    print("=====================================")
-    print("CLARIFICATION RESOLUTION TRACE")
-    print("=====================================")
-    print(f"Clarification Type  : {clarification_type}")
-    print(f"Original Request    : {original_request}")
-    print(f"Options             : {options if options else 'N/A'}")
-    print(f"Selected Option     : {selected_option}")
-    print(f"Reconstructed Req   : {reconstructed_request}")
-    print(f"Override Target DB  : {override_target_db}")
-    print("=====================================")
+# ─── Clarification resolution imported from shared module (Stage 3) ────────────
+from agent.pending_resolution import (  # noqa: E402
+    _print_clarification_trace,
+    resolve_pending_clarification,
+    _build_db_resolution_result,
+    _build_table_resolution_result,
+)
 
 
-def resolve_pending_clarification(message: str, pending: dict) -> dict:
-    msg = message.strip().lower()
-    
-    # 1. Cancellation terms (including confirmation rejections)
-    if msg in {"cancel", "nevermind", "stop", "reset", "no", "n", "reject", "deny"}:
-        _print_clarification_trace(
-            clarification_type=pending.get("type"),
-            original_request=pending.get("original_request", "<unknown>"),
-            options=pending.get("options", []),
-            selected_option="cancel",
-            reconstructed_request="<cancelled>",
-            override_target_db="<none>",
-        )
-        return {
-            "resolved": True,
-            "selected_option": "cancel",
-            "clarification_type": pending.get("type"),
-            "reconstructed_request": None,
-            "override_target_db": None,
-            "metadata": {}
-        }
-        
-    clar_type = pending.get("type")
-    
-    # 2. CREATE_TABLE_COLUMNS
-    if clar_type == "CREATE_TABLE_COLUMNS":
-        table_name = pending.get("table_name")
-        
-        # Validation 1: table_name exists in pending clarification
-        if not table_name:
-            print("[Clarification] Validation failed: table_name missing in pending clarification.")
-            return {
-                "resolved": False,
-                "selected_option": None,
-                "clarification_type": clar_type,
-                "reconstructed_request": None,
-                "override_target_db": None,
-                "metadata": {}
-            }
-            
-        # Validation 2: table_name matches valid identifier pattern
-        identifier_pat = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]*$')
-        if not identifier_pat.match(table_name):
-            print(f"[Clarification] Validation failed: table_name '{table_name}' is not a valid SQL identifier.")
-            return {
-                "resolved": False,
-                "selected_option": None,
-                "clarification_type": clar_type,
-                "reconstructed_request": None,
-                "override_target_db": None,
-                "metadata": {}
-            }
-            
-        # Validation 3: columns string is non-empty
-        columns_str = message.strip()
-        if not columns_str:
-            print("[Clarification] Validation failed: columns definition is empty.")
-            return {
-                "resolved": False,
-                "selected_option": None,
-                "clarification_type": clar_type,
-                "reconstructed_request": None,
-                "override_target_db": None,
-                "metadata": {}
-            }
-            
-        if not is_valid_column_definition(message):
-            print(f"[Clarification] Invalid column definition structure: {repr(message)}")
-            return {
-                "resolved": False,
-                "selected_option": None,
-                "clarification_type": clar_type,
-                "reconstructed_request": None,
-                "override_target_db": None,
-                "metadata": {}
-            }
-            
-        target_db = pending.get("target_db")
-        
-        # Format columns with 4-space indentation and newline
-        parts = [p.strip() for p in split_column_definitions(message)]
-        indented_parts = [f"    {p}" for p in parts]
-        cols_formatted = ",\n".join(indented_parts)
-        reconstructed = f"CREATE TABLE {table_name} (\n{cols_formatted}\n);"
-        
-        # Validation 4: log/print resolution trace before execution
-        orig_req = pending.get("original_request", "<unknown>")
-        print("=====================================")
-        print("CLARIFICATION RESOLUTION TRACE")
-        print("=====================================")
-        print("Original Request:")
-        print(orig_req)
-        print()
-        print("Resolved Columns:")
-        print(columns_str)
-        print()
-        print("Generated SQL:")
-        print(reconstructed)
-        print("=====================================")
-        
-        return {
-            "resolved": True,
-            "selected_option": message.strip(),
-            "clarification_type": clar_type,
-            "reconstructed_request": reconstructed,
-            "override_target_db": target_db,
-            "metadata": {}
-        }
-        
-    # 3. CONFIRMATION
-    if clar_type == "CONFIRMATION":
-        if msg in {"confirm", "yes", "y", "ok", "proceed"}:
-            sql = pending.get("metadata", {}).get("sql")
-            target_db = pending.get("target_db")
-            _print_clarification_trace(
-                clarification_type=clar_type,
-                original_request=pending.get("original_request", "<unknown>"),
-                options=[],
-                selected_option="confirm",
-                reconstructed_request=sql or "<none>",
-                override_target_db=target_db or "<none>",
+# ──────────────────────────────────────────────────────────────────────────────
+# resolve_pending_clarification, _print_clarification_trace,
+# _build_db_resolution_result, and _build_table_resolution_result have been
+# moved to agent/pending_resolution.py (Stage 3).
+# They are imported above.
+# ──────────────────────────────────────────────────────────────────────────────
+"""
+[REMOVED: resolve_pending_clarification_OLD body — see agent/pending_resolution.py]
+"""
+# ─── Phase 8: /chat endpoint ─────────────────────────────────────────────────
+
+def _resolve_chat_session(user_id: int, session_id: Optional[str]) -> str:
+    """
+    Phase 9.5 — Server-controlled chat sessions.
+
+    Resolves and validates the chat session id for the authenticated user:
+      * If the client omits a session id, the server generates one.
+      * A new session is persisted (ChatSession row) so it is server-owned,
+        survives restarts, and can be revoked on logout / password change.
+      * A session id owned by another user, deactivated, or expired is rejected.
+
+    Returns the validated session id, raising HTTPException otherwise.
+    """
+    from datetime import datetime
+    from db.app_database import SessionLocal
+    from repositories.chat_session_repository import ChatSessionRepository
+
+    if not session_id:
+        import uuid
+        session_id = uuid.uuid4().hex
+
+    db = SessionLocal()
+    try:
+        repo = ChatSessionRepository(db)
+        chat_session = repo.get_by_session_id(session_id)
+        if chat_session is None:
+            repo.create(session_id, user_id)
+            return session_id
+
+        if chat_session.user_id != user_id:
+            raise HTTPException(status_code=403, detail="Invalid session")
+        if not chat_session.is_active:
+            raise HTTPException(
+                status_code=403,
+                detail="This conversation has ended. Please start a new one.",
             )
-            return {
-                "resolved": True,
-                "selected_option": "confirm",
-                "clarification_type": clar_type,
-                "reconstructed_request": sql,
-                "override_target_db": target_db,
-                "metadata": {}
-            }
-        else:
-            print("[Clarification] CONFIRMATION — user response not recognised as confirmation, resolved=False")
-            return {
-                "resolved": False,
-                "selected_option": None,
-                "clarification_type": clar_type,
-                "reconstructed_request": None,
-                "override_target_db": None,
-                "metadata": {}
-            }
-            
-    # 4. AMBIGUOUS_TABLE_LOCATION and MISSING_DATABASE
-    if clar_type in {"AMBIGUOUS_TABLE_LOCATION", "MISSING_DATABASE"}:
-        options = pending.get("options", [])
-        cleaned_options = [opt.strip().lower() for opt in options]
-        
-        # 1. Exact match check (case-insensitive) first
-        for idx, opt in enumerate(cleaned_options):
-            if msg == opt:
-                selected = options[idx]
-                return _build_db_resolution_result(clar_type, selected, pending)
-                
-        # Sort options by length descending to prevent option shadowing
-        sorted_options = sorted(list(enumerate(cleaned_options)), key=lambda x: len(x[1]), reverse=True)
-        
-        # 2. Word boundary check (longest options first)
-        for idx, opt in sorted_options:
-            if re.search(rf"\b{re.escape(opt)}\b", msg):
-                selected = options[idx]
-                return _build_db_resolution_result(clar_type, selected, pending)
-                
-        # 3. Ordinal words to index map
-        ordinals = {
-            "first": 0, "1st": 0, "1": 0, "one": 0,
-            "second": 1, "2nd": 1, "2": 1, "two": 1,
-            "third": 2, "3rd": 2, "3": 2, "three": 2,
-        }
-        for word, idx in ordinals.items():
-            if re.search(rf"\b{word}\b", msg) and idx < len(options):
-                selected = options[idx]
-                return _build_db_resolution_result(clar_type, selected, pending)
-                
-        # 4. Numerical patterns (e.g. database 1, selection 2)
-        numeric_patterns = [
-            r"\b(?:database|db|option|choice|number|selection)\s+(\d+)\b",
-            r"\b(?:the\s+)?(\w+)\s+(?:database|db|option)\b"
-        ]
-        for pat in numeric_patterns:
-            match = re.search(pat, msg)
-            if match:
-                val = match.group(1)
-                if val.isdigit():
-                    idx = int(val) - 1
-                    if 0 <= idx < len(options):
-                        selected = options[idx]
-                        return _build_db_resolution_result(clar_type, selected, pending)
-                else:
-                    if val in ordinals:
-                        idx = ordinals[val]
-                        if idx < len(options):
-                            selected = options[idx]
-                            return _build_db_resolution_result(clar_type, selected, pending)
-                            
-        # 5. Substring keyword check (longest options first)
-        for idx, opt in sorted_options:
-            if opt in msg:
-                selected = options[idx]
-                return _build_db_resolution_result(clar_type, selected, pending)
-                
-    # Could not match any resolution strategy
-    print(
-        f"[Clarification] UNRESOLVED — type={clar_type} message={repr(message)} "
-        f"options={pending.get('options', [])}"
-    )
-    return {
-        "resolved": False,
-        "selected_option": None,
-        "clarification_type": clar_type,
-        "reconstructed_request": None,
-        "override_target_db": None,
-        "metadata": {}
-    }
+        if chat_session.expires_at is not None and chat_session.expires_at < datetime.utcnow():
+            raise HTTPException(
+                status_code=403,
+                detail="This conversation has expired. Please start a new one.",
+            )
+        repo.touch(chat_session)
+        return session_id
+    finally:
+        db.close()
 
-
-def _build_db_resolution_result(clar_type: str, selected: str, pending: dict) -> dict:
-    orig_req = pending.get("original_request")
-    _print_clarification_trace(
-        clarification_type=clar_type,
-        original_request=orig_req or "<unknown>",
-        options=pending.get("options", []),
-        selected_option=selected,
-        reconstructed_request=orig_req or "<none>",
-        override_target_db=selected,
-    )
-    return {
-        "resolved": True,
-        "selected_option": selected,
-        "clarification_type": clar_type,
-        "reconstructed_request": orig_req,
-        "override_target_db": selected,
-        "metadata": {}
-    }
-
-
-# ─── Phase 8: /chat endpoint ─────────────────────────────────────────────────
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
-    # ── Phase 8.5: Start metrics request tracking ───────────────────────────
-    gemini_metrics.start_request(request.message)
+async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_current_user)):
+    from state.metadata_store import get_cache_generation
 
-    # ── Phase 6: Load session from RAM store ─────────────────────────────────
+    # Phase 9.5: Enforce server-side session ownership before any work happens.
+    request.session_id = _resolve_chat_session(current_user.id, request.session_id)
+
+    # Bind request-level context variables
+    session_token = session_id_var.set(request.session_id)
+    user_id_token = user_id_var.set(current_user.id)
+    
+    # Load session to get selected database/table if any
     session = get_session(request.session_id)
     log_session_state(request.session_id)
 
-    # ── Extract dynamic context from in-memory metadata store ─────────────────
-    meta              = get_metadata()
-    current_db        = meta.get("selected_db")
-    routing_summaries = meta.get("routing_summaries", {})
+    initial_db = session.get("selected_database")
+    initial_table = session.get("selected_table")
 
-    # ── Phase 8.7: Defensive lazy refresh ────────────────────────────────────
-    # Safety net: if routing summaries are empty (startup init failed, or DB was
-    # unreachable at boot), attempt to rebuild them now before any routing logic runs.
-    # This ensures all three routing paths work even without a prior /api/databases call.
-    if not routing_summaries:
-        print("[Phase 8.7] routing_summaries empty at request time — triggering lazy refresh.")
-        try:
-            from db.schema_fetcher import fetch_all_databases
-            from state.metadata_store import set_databases
-            dbs = fetch_all_databases()
-            set_databases(dbs)
-            refresh_routing_summaries()
-            routing_summaries = get_metadata().get("routing_summaries", {})
-            print(f"[Phase 8.7] Lazy refresh complete: {list(routing_summaries.keys())}")
-        except Exception as e:
-            print(f"[Phase 8.7] WARNING: Lazy refresh failed: {e}")
+    db_token = database_name_var.set(initial_db)
+    table_token = selected_table_var.set(initial_table)
+    mv_token = metadata_version_var.set(get_cache_generation())
 
-    # ── Check for existing pending clarification ─────────────────────────────
-    pending = session.get("pending_clarification")
-    if pending:
-        created_at = pending.get("created_at", 0)
-        # Timeout Check: 15 minutes limit (900 seconds)
-        if time.time() - created_at > 900:
-            print("[Phase 8.11] Clarification expired after timeout.")
-            session["pending_clarification"] = None
-            pending = None
-        elif is_new_command_detected(request.message):
-            print(f"[Phase 8.11] New command detected. Discarding pending clarification: {request.message}")
-            session["pending_clarification"] = None
-            pending = None
-        else:
-            # Try to resolve
-            resolve = resolve_pending_clarification(request.message, pending)
-            if resolve["resolved"]:
-                print("[Phase 8.11] Clarification resolved.")
-                print(f"Type      : {resolve['clarification_type']}")
-                print(f"Selection : {resolve['selected_option']}")
-                
-                if resolve["selected_option"] == "cancel":
-                    print("[Phase 8.11] Clarification canceled by user.")
-                    session["pending_clarification"] = None
-                    return ChatResponse(
-                        reply="Clarification cancelled. Let's start again.",
-                        intent="CANCEL",
-                        database=None,
-                        valid=True
+    try:
+        _cleaned_message, _intent_meta = _typo_intent_process(request.message)
+        session["last_intent_meta"] = _intent_meta
+
+        # ── Phase 8.5: Start metrics request tracking ───────────────────────────
+        gemini_metrics.start_request(_cleaned_message)
+
+        # ── Extract dynamic context from in-memory metadata store ─────────────────
+        meta              = get_metadata()
+        current_db        = meta.get("selected_db")
+        routing_summaries = meta.get("routing_summaries", {})
+
+        # ── Phase 8.7: Defensive lazy refresh ────────────────────────────────────
+        # Safety net: if routing summaries are empty (startup init failed, or DB was
+        # unreachable at boot), attempt to rebuild them now before any routing logic runs.
+        # This ensures all three routing paths work even without a prior /api/databases call.
+        if not routing_summaries:
+            print("[Phase 8.7] routing_summaries empty at request time — triggering lazy refresh.")
+            try:
+                from db.schema_fetcher import fetch_all_databases
+                from state.metadata_store import set_databases
+                dbs = fetch_all_databases()
+                set_databases(dbs)
+                refresh_routing_summaries()
+                routing_summaries = get_metadata().get("routing_summaries", {})
+                print(f"[Phase 8.7] Lazy refresh complete: {list(routing_summaries.keys())}")
+            except Exception as e:
+                print(f"[Phase 8.7] WARNING: Lazy refresh failed: {e}")
+
+        # ── Pending operation state removed (Stage 4) ───────────────────────────
+        # The pending_operation block was a legacy duplicate of pending_clarification
+        # with hardcoded type-inference heuristics. All pending clarification handling
+        # is now owned by the Universal Gateway via decide().
+
+        # ── Pending clarification block removed (Stage 4) ───────────────────────
+        # All pending clarification resolution, timeout, new-command detection,
+        # CONFIRMATION execution, and re-routing is now owned by the Universal
+        # Gateway via decide().
+
+        # ── Single Authoritative Gateway Call ───────────────────────────────────
+        # The Universal Semantic Gateway is the ONE entry point for understanding,
+        # context resolution (pending clarification), and routing. No downstream
+        # component re-classifies or re-routes.
+        from agent.universal_gateway import decide
+        session_db = session.get("selected_database")
+        explicit_db = _extract_explicit_db(_cleaned_message, routing_summaries)
+
+        decision = decide(
+            user_message=_cleaned_message,
+            raw_message=request.message,
+            database_context=explicit_db or session_db,
+            session=session,
+            request_db=getattr(request, "database", None),
+        )
+
+        intent = decision.understanding.intent
+        confidence = decision.understanding.confidence
+        target_db = decision.target_db
+        database_name_var.set(target_db)
+
+        if decision.understanding.source == "DETERMINISTIC":
+            gemini_metrics.record_bypass("intent_classifier")
+            gemini_metrics.record_bypass("router")
+
+        # Print gateway decision trace
+        print("\n====================================")
+        print("GATEWAY DECISION")
+        print("====================================")
+        print(f"Route      : {decision.route}")
+        print(f"Intent     : {intent}")
+        print(f"Target DB  : {target_db}")
+        print(f"Table      : {decision.target_table}")
+        print(f"Tool       : {decision.tool_name}")
+        print(f"Clarif.    : {decision.clarification_type}")
+        print(f"Reason     : {decision.reason}")
+        print("====================================\n")
+
+        # ── Route: CLARIFICATION ───────────────────────────────────────────────
+        # The gateway determined the message needs clarification.
+        # Store pending state and return the clarification question.
+        if decision.route == "CLARIFICATION":
+            if decision.clarification_type == "UNRECOGNIZED_QUERY":
+                return ChatResponse(
+                    reply="I couldn't safely understand this request. Please rephrase your query.",
+                    intent="UNDERSTANDING_FAILED",
+                    database=session_db,
+                    valid=False
+                )
+
+            if decision.clarification_data:
+                # Frame-based clarification (agent.semantic_frame) — carries the
+                # richer options/metadata shape pending_resolution.py's resolver
+                # needs (e.g. real database/table candidate lists).
+                pending_state = dict(decision.clarification_data)
+                pending_state["created_at"] = time.time()
+                pending_state.setdefault("attempts", 0)
+                session["pending_clarification"] = pending_state
+            else:
+                session["pending_clarification"] = {
+                    "type": decision.clarification_type,
+                    "original_request": request.message,
+                    "target_db": target_db,
+                    "created_at": time.time(),
+                    "attempts": 0,
+                    "table_name": decision.target_table
+                }
+            reply_text = decision.clarification_message
+            if not reply_text:
+                if decision.target_table:
+                    reply_text = f"Which database contains table **{decision.target_table}**? Please select a database."
+                else:
+                    reply_text = "Could you please clarify your request?"
+
+            return ChatResponse(
+                reply=reply_text,
+                intent="NEEDS_CLARIFICATION",
+                database=session_db,
+                question=reply_text,
+                valid=True
+            )
+
+        # ── Route: CONFIRMATION ────────────────────────────────────────────────
+        # The gateway resolved a pending clarification and returned SQL to execute.
+        # This covers:
+        #   - CONFIRMATION: user confirmed a DDL/DML operation
+        #   - CREATE_TABLE_COLUMNS: user provided column definitions for a pending
+        #     CREATE TABLE — the gateway produced the full CREATE TABLE SQL.
+        if decision.route == "CONFIRMATION":
+            clar_data = decision.clarification_data or {}
+            sql = clar_data.get("sql")
+            exec_db = clar_data.get("target_db") or target_db
+
+            if not sql:
+                return ChatResponse(
+                    reply="No SQL to execute from the confirmation.",
+                    intent="CONFIRMATION",
+                    database=exec_db,
+                    valid=False
+                )
+
+            from db.executor import execute_sql as db_execute_sql, requires_superdb
+            if requires_superdb(sql):
+                exec_db = get_superdb_name()
+
+            database_name_var.set(exec_db)
+            execution_result = db_execute_sql(sql, exec_db)
+
+            if execution_result.get("success"):
+                op = execution_result.get("operation", "")
+                _update_session_from_execution(request.session_id, "CONFIRMATION", sql, execution_result)
+
+                # Refresh metadata cache
+                from state.metadata_store import refresh_metadata_after_ddl
+                refresh_metadata_after_ddl(sql, exec_db, op)
+
+                # Commit state: Clear clarification
+                session["pending_clarification"] = None
+                print("[Stage 4] CONFIRMATION executed successfully.")
+                try:
+                    logger_audit.info(
+                        "CONFIRMATION executed successfully",
+                        extra={
+                            "category": "audit",
+                            "operation_type": "CONFIRMATION_EXECUTED",
+                            "clarification_type": decision.clarification_type,
+                            "session_id": request.session_id,
+                            "sql": sql,
+                            "database_name": exec_db
+                        }
                     )
-                
-                # If confirmation, execute DDL/DML directly
-                if resolve["clarification_type"] == "CONFIRMATION":
-                    from db.executor import execute_sql as db_execute_sql, requires_superdb
-                    sql = resolve["reconstructed_request"]
-                    exec_db = resolve["override_target_db"]
-                    if requires_superdb(sql):
-                        exec_db = os.getenv("DB_SUPERDB", "postgres")
-                    
-                    execution_result = db_execute_sql(sql, exec_db)
-                    
-                    if execution_result.get("success"):
-                        # Update session memory
-                        op = execution_result.get("operation", "")
-                        sql_parts = sql.strip().split()
-                        kwargs = {"last_successful_intent": "CONFIRMATION", "add_operation": op}
-                        if op == "CREATE DATABASE" and len(sql_parts) >= 3:
-                            kwargs["selected_database"] = sql_parts[2].strip('";')
-                        elif op in {"CREATE", "ALTER", "CREATE TABLE", "ALTER TABLE"} and len(sql_parts) >= 3 and sql_parts[1].upper() == "TABLE":
-                            if "RENAME" not in sql.upper():
-                                from db.executor import extract_table_name
-                                new_tbl = extract_table_name(sql)
-                                if new_tbl:
-                                    kwargs["selected_table"] = new_tbl
-                        update_session(request.session_id, **kwargs)
+                except Exception:
+                    pass
 
-                        # Handle DROP TABLE cleanup
-                        if op == "DROP" and "TABLE" in sql.upper():
-                            match = re.search(r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([a-zA-Z0-9_\"'`]+)", sql, re.IGNORECASE)
-                            if match:
-                                dropped_table = match.group(1).strip('`"\'')
-                                from state.session_store import clear_session_table
-                                clear_session_table(request.session_id, dropped_table)
+                response = ChatResponse(
+                    reply="✅ Execution complete.",
+                    intent="CONFIRMATION",
+                    database=exec_db,
+                    sql=sql,
+                    valid=True,
+                    risk_level="SAFE",
+                    requires_confirmation=False,
+                    execution=execution_result,
+                    refresh_databases=(op == "CREATE DATABASE"),
+                    refresh_tables=(op in {"CREATE", "ALTER", "DROP"}),
+                    refresh_schema=(op in {"CREATE", "ALTER", "DROP"}),
+                )
+                return response
+            else:
+                error = execution_result.get("error", "unknown error")
+                try:
+                    logger_audit.error(
+                        f"CONFIRMATION execution failed: {error}",
+                        extra={
+                            "category": "audit",
+                            "operation_type": "CONFIRMATION_FAILED",
+                            "clarification_type": decision.clarification_type,
+                            "session_id": request.session_id,
+                            "sql": sql,
+                            "database_name": exec_db,
+                            "error": error
+                        }
+                    )
+                except Exception:
+                    pass
+                return ChatResponse(
+                    reply=f"❌ Execution failed: {error}",
+                    intent="CONFIRMATION",
+                    database=exec_db,
+                    sql=sql,
+                    valid=True,
+                    risk_level="SAFE",
+                    requires_confirmation=False,
+                    execution=execution_result
+                )
 
-                        # Handle ALTER TABLE RENAME TO
-                        elif op == "ALTER" and "TABLE" in sql.upper() and "RENAME" in sql.upper():
-                            match = re.search(r"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?([a-zA-Z0-9_\"'`]+)\s+RENAME\s+TO\s+([a-zA-Z0-9_\"'`]+)", sql, re.IGNORECASE)
-                            if match:
-                                old_table = match.group(1).strip('`"\'')
-                                new_table = match.group(2).strip('`"\'')
-                                from state.session_store import rename_session_table
-                                rename_session_table(request.session_id, old_table, new_table)
-                        
-                        # Handle DROP DATABASE session cleanup
-                        from db.executor import _clean_sql
-                        cleaned_sql = _clean_sql(sql)
-                        is_drop_db = (
-                            op == "DROP DATABASE"
-                            or (op == "DROP" and "DATABASE" in cleaned_sql.upper())
-                        )
-                        if is_drop_db:
-                            match = re.search(r"DROP\s+DATABASE\s+(?:IF\s+EXISTS\s+)?([a-zA-Z0-9_\"'`]+)", cleaned_sql, re.IGNORECASE)
-                            if match:
-                                dropped_db = match.group(1).strip('`"\'')
-                                meta = get_metadata()
-                                routing_summaries = meta.get("routing_summaries", {})
-                                db_tables = []
-                                for d_name, t_names in routing_summaries.items():
-                                    if d_name.lower() == dropped_db.lower():
-                                        db_tables = t_names
-                                        break
-                                from state.session_store import clear_session_database
-                                clear_session_database(request.session_id, dropped_db, db_tables)
+        # ── Route: CONVERSATION ────────────────────────────────────────────────
+        if decision.route == "CONVERSATION":
+            from agent.handlers import get_handler
+            handler = get_handler(intent)
+            start_time = time.perf_counter()
+            agent_result = handler.handle(
+                message=_cleaned_message,
+                metadata=decision.understanding.model_dump(),
+                target_db=None,
+                router_db=None,
+                session=session,
+                session_id=request.session_id,
+                history=request.history or [],
+            )
+            gemini_metrics.end_request()
+            return ChatResponse(
+                reply=agent_result.get("reply", ""),
+                intent=intent,
+                database=None,
+                sql=None,
+                question=None,
+                valid=agent_result.get("valid", True),
+                execution=None,
+            )
 
-                        # Refresh metadata cache
-                        from state.metadata_store import refresh_metadata_after_ddl
-                        refresh_metadata_after_ddl(sql, exec_db, op)
-                        
-                        # Commit state: Clear clarification
-                        session["pending_clarification"] = None
-                        print("[Phase 8.11] Clarification completed successfully.")
-                        print("State committed.")
-                        
-                        response = ChatResponse(
-                            reply="✅ Execution complete.",
-                            intent="CONFIRMATION",
-                            database=exec_db,
-                            sql=sql,
-                            valid=True,
-                            risk_level="SAFE",
-                            requires_confirmation=False,
-                            execution=execution_result,
-                            refresh_databases=(op == "CREATE DATABASE"),
-                            refresh_tables=(op in {"CREATE", "ALTER", "DROP"}),
-                            refresh_schema=(op in {"CREATE", "ALTER", "DROP"}),
-                        )
-                        return response
-                    else:
-                        # Execution failed: Do NOT clear pending state
-                        error = execution_result.get("error", "unknown error")
-                        return ChatResponse(
-                            reply=f"❌ Execution failed: {error}",
-                            intent="CONFIRMATION",
-                            database=exec_db,
-                            sql=sql,
-                            valid=True,
-                            risk_level="SAFE",
-                            requires_confirmation=False,
-                            execution=execution_result
-                        )
+        # ── Route: DIRECT / AI_PLANNER / RAW_SQL ───────────────────────────────
+        # Build intent metadata for handler dispatch. The handler reads route
+        # from metadata to decide DIRECT vs AI_PLANNER execution path.
+        intent_meta = decision.understanding.model_dump()
+        intent_meta["target_db"] = target_db
+        intent_meta["target_table"] = decision.target_table
+        intent_meta["route"] = decision.route
 
-                # Reconstruct request for other query types
-                reconstructed_message = resolve["reconstructed_request"]
-                override_db = resolve["override_target_db"]
-                
-                from agent.agent_coordinator import run as agent_run
-                gemini_metrics.start_request(reconstructed_message)
-                
-                agent_result = agent_run(
-                    user_message=reconstructed_message,
-                    router_db=override_db,
+        # ── CONNECTION GUARD ───────────────────────────────────────────────────
+        try:
+            from connections.connection_manager import ConnectionManager
+            from db.app_database import SessionLocal as _GuardSessionLocal
+            _guard_db = _GuardSessionLocal()
+            try:
+                ConnectionManager.get_connection(current_user.id, _guard_db)
+                print(f"[Connection Guard] Active connection confirmed for user {current_user.id}.")
+            except ValueError as _conn_err:
+                print(f"[Connection Guard] FAILED for user {current_user.id}: {_conn_err}")
+                gemini_metrics.end_request()
+                return ChatResponse(
+                    reply="No active database session. Please reconnect before running queries.",
+                    intent="NO_CONNECTION",
+                    database=None,
+                    valid=False,
+                )
+            finally:
+                _guard_db.close()
+        except Exception as _guard_exc:
+            print(f"[Connection Guard] Unexpected error during guard check: {_guard_exc}. Continuing.")
+
+        # Execute route via handler dispatch
+        from agent.handlers import get_handler
+        handler = get_handler(intent)
+        pipeline_start_time = time.perf_counter()
+        agent_result = handler.handle(
+            message=_cleaned_message,
+            metadata=intent_meta,
+            target_db=target_db,
+            router_db=target_db,
+            session=session,
+            session_id=request.session_id,
+            history=request.history or [],
+            decision=decision,
+        )
+
+        gemini_metrics.end_request()
+        pipeline_duration_ms = (time.perf_counter() - pipeline_start_time) * 1000
+        intent = agent_result.get("intent", "UNKNOWN")
+
+        # Print REQUEST SUMMARY
+        print("\n====================================")
+        print("REQUEST SUMMARY")
+        print("====================================")
+        print(f"User Intent:\n  {decision.understanding.intent}")
+        print(f"Execution Intent:\n  {intent}")
+        print(f"Route:\n  {decision.route}")
+        print(f"Execution Time:\n  {pipeline_duration_ms:.2f} ms")
+        print("====================================\n")
+
+        # ── Handle newly created Needs Clarification ─────────────────────────────
+        if intent == "NEEDS_CLARIFICATION":
+            if "clarification_data" in agent_result:
+                clar_data = agent_result["clarification_data"]
+                clar_data["created_at"] = time.time()
+                clar_data["attempts"] = 0
+                session["pending_clarification"] = clar_data
+
+                print("[Stage 4] Clarification created.")
+                print(f"Type      : {clar_data.get('type')}")
+                print(f"Target DB : {clar_data.get('target_db')}")
+
+                try:
+                    logger_audit.info(
+                        f"Needs clarification triggered: {clar_data.get('type')}",
+                        extra={
+                            "category": "audit",
+                            "operation_type": "CLARIFICATION_CREATED",
+                            "clarification_type": clar_data.get("type"),
+                            "session_id": request.session_id,
+                            "target_db": clar_data.get("target_db"),
+                            "question": clar_data.get("question")
+                        }
+                    )
+                except Exception:
+                    pass
+
+        # Update session context if request succeeds
+        execution = agent_result.get("execution")
+        execution_success = execution.get("success", True) if execution else True
+
+        processed_res = None
+        visualization_result = None
+        if agent_result.get("valid", True) and intent != "NEEDS_CLARIFICATION":
+            if execution_success:
+                final_db = agent_result.get("database") or target_db
+                kwargs = {}
+                if final_db and final_db in routing_summaries:
+                    kwargs["selected_database"] = final_db
+
+                if intent not in {"NEEDS_CLARIFICATION", "UNKNOWN", "ERROR", "RATE_LIMITED", "CANCEL"}:
+                    kwargs["last_successful_intent"] = intent
+                    kwargs["last_user_intent"] = decision.understanding.intent
+                    kwargs["last_execution_intent"] = intent
+
+                if kwargs:
+                    update_session(request.session_id, **kwargs)
+                    selected_table_var.set(session.get("selected_table"))
+
+                # Process raw SQL execution result through centralized Result Processor
+                processed_res = _process_sql_execution_result(
+                    agent_result=agent_result,
                     session=session,
                     session_id=request.session_id,
-                    history=request.history or [],
-                    target_db=override_db,
+                    classification={"category": intent, "pipeline": "STANDARD", "source": decision.understanding.source, "user_intent": decision.understanding.intent},
+                    selected_pipeline_name="STANDARD",
+                    execution_path=f"STANDARD -> HANDLER -> {intent}",
+                    target_db=target_db
                 )
-                
-                gemini_metrics.end_request()
-                
-                execution = agent_result.get("execution")
-                success = True
-                if execution and not execution.get("success"):
-                    success = False
-                    
-                if success:
-                    # Sync DB to session if relevant
-                    final_db = agent_result.get("database") or override_db
-                    if final_db and final_db in routing_summaries:
-                        update_session(request.session_id, selected_database=final_db)
-                        
-                    # Commit state: Clear clarification
-                    session["pending_clarification"] = None
-                    print("[Phase 8.11] Clarification completed successfully.")
-                    print("State committed.")
-                else:
-                    print("[Phase 8.11] Clarification execution failed. Retaining pending state.")
-                    
-                return ChatResponse(
-                    reply=agent_result.get("reply", ""),
-                    intent=agent_result.get("intent", "UNKNOWN"),
-                    database=agent_result.get("database", override_db),
-                    sql=agent_result.get("sql"),
-                    question=agent_result.get("question"),
-                    valid=agent_result.get("valid", True),
-                    risk_level=agent_result.get("risk_level", "SAFE"),
-                    requires_confirmation=agent_result.get("requires_confirmation", False),
-                    blocked_reason=agent_result.get("blocked_reason"),
-                    execution=agent_result.get("execution"),
-                    refresh_databases=agent_result.get("refresh_databases", False),
-                    refresh_tables=agent_result.get("refresh_tables", False),
-                    refresh_schema=agent_result.get("refresh_schema", False),
-                )
-                
-            else:
-                # Unresolved
-                pending["attempts"] += 1
-                if pending["attempts"] >= 3:
-                    print("[Phase 8.11] Clarification expired after max attempts.")
-                    session["pending_clarification"] = None
-                    return ChatResponse(
-                        reply="I couldn't determine a valid selection. Let's start again.",
-                        intent="CANCEL",
-                        database=None,
-                        valid=True
-                    )
-                else:
-                    print(f"[Phase 8.11] Clarification attempt {pending['attempts']}/3 failed.")
-                    # Re-prompt same clarification question
-                    return ChatResponse(
-                        reply=pending.get("question", "Could you clarify your choice?"),
-                        intent="NEEDS_CLARIFICATION",
-                        database=pending.get("target_db"),
-                        question=pending.get("question"),
-                        valid=True
-                    )
 
-    # ── Phase 7 / 7.1 / 8.4: AI Database Router with cascading short-circuit ──
-    session_db  = session.get("selected_database")
-    explicit_db = _extract_explicit_db(request.message, routing_summaries)
+            # Save classification context in session memory
+            msg_count = session.get("message_count", 0) + 1
+            session["message_count"] = msg_count
+            session["last_classification"] = {
+                "category": intent,
+                "pipeline": "STANDARD",
+                "presentation": "TABLE",
+                "timestamp": time.time(),
+                "sequence_id": msg_count
+            }
 
-    # ── Phase 4.5 Finding 3: Skip Router AI for deterministic requests ────────
-    # If the message matches any deterministic dispatch rule (SWITCH_DB, UTILITY,
-    # SCHEMA, RAW_SQL, DDL, DML, QUERY), the Router AI call adds zero value.
-    # Target DB will be resolved via explicit_db / session / metadata fallbacks.
-    _dispatch_tool = _deterministic_dispatch(request.message)
-    if _dispatch_tool:
-        router_db     = explicit_db or session_db
-        router_source = "DETERMINISTIC_BYPASS"
-        gemini_metrics.record_bypass("router")
-        print(
-            f"[Phase 4.5] Router AI skipped — deterministic dispatch to '{_dispatch_tool}'."
+        execution_payload = agent_result.get("execution")
+        if processed_res:
+            from models.schemas import ExecutionResult
+            columns_to_return = processed_res.dataset.columns
+            rows_to_return = processed_res.dataset.dataframe.values.tolist() if processed_res.dataset.dataframe is not None else []
+
+            execution_payload = ExecutionResult(
+                success=True,
+                operation=agent_result.get("execution", {}).get("operation") or "SELECT",
+                columns=columns_to_return,
+                rows=rows_to_return,
+                row_count=len(rows_to_return),
+                message=agent_result.get("execution", {}).get("message") or "Query executed successfully.",
+                error=agent_result.get("execution", {}).get("error")
+            )
+
+        response = ChatResponse(
+            reply=agent_result.get("reply", ""),
+            intent=intent,
+            database=session.get("selected_database") if session.get("selected_database") is not None else (agent_result.get("database") or target_db),
+            sql=agent_result.get("sql"),
+            question=agent_result.get("question"),
+            valid=agent_result.get("valid", True),
+            risk_level=agent_result.get("risk_level", "SAFE"),
+            requires_confirmation=agent_result.get("requires_confirmation", False),
+            blocked_reason=agent_result.get("blocked_reason"),
+            execution=execution_payload,
+            refresh_databases=agent_result.get("refresh_databases", False),
+            refresh_tables=agent_result.get("refresh_tables", False),
+            refresh_schema=agent_result.get("refresh_schema", False),
         )
-    elif explicit_db:
-        router_db     = explicit_db
-        router_source = "EXPLICIT_PATTERN"
-        gemini_metrics.record_bypass("router")
-        print(f"[Phase 8.4] Explicit DB pattern match '{explicit_db}' — skipping Router AI.")
-    elif session_db and session_db in routing_summaries:
-        router_db     = session_db
-        router_source = "SESSION_SHORT_CIRCUIT"
-        gemini_metrics.record_bypass("router")
-        print(f"\n[Phase 7.1] Session short-circuit: '{session_db}' in routing summaries — skipping Router AI.")
-    else:
-        # Determine Router Trigger Reason
-        if not session_db and not explicit_db and not current_db:
-            router_trigger_reason = "NO_TARGET_DB"
-        elif not session_db:
-            router_trigger_reason = "NO_SESSION_DB"
-        elif session_db not in routing_summaries:
-            router_trigger_reason = "UNKNOWN_DATABASE"
-        else:
-            router_trigger_reason = "AMBIGUOUS_DATABASE"
-            
-        print(f"Router Trigger Reason: {router_trigger_reason}")
 
-        router_db = route_to_database(
-            question=request.message,
-            routing_summaries=routing_summaries,
-            session=session,
-            history=request.history,
-        )
-        router_source = "ROUTER_AI"
+        return response
 
-    target_db = (
-        explicit_db
-        or router_db
-        or session.get("selected_database")
-        or current_db
-    )
-
-    print("\n====================================")
-    print("PHASE 7 / 6.1 EXECUTION CONTEXT")
-    print("================================")
-    print(f"Router Decision:\n  {router_db or 'None'} (via {router_source})")
-    print(f"Frontend Selected Database:\n  {current_db}")
-    print(f"Session Memory Database:\n  {session.get('selected_database')}")
-    print(f"Initial Target DB:\n  {target_db}")
-    print("====================================\n")
-
-    # ── Phase 8: Delegate to Agent Coordinator ────────────────────────────────
-    from agent.agent_coordinator import run as agent_run
-
-    agent_result = agent_run(
-        user_message=request.message,
-        router_db=router_db,
-        session=session,
-        session_id=request.session_id,
-        history=request.history or [],
-        target_db=target_db,
-    )
-
-    print("\n====================================")
-    print("REQUEST GEMINI SUMMARY")
-    print("====================================")
-    summary = gemini_metrics.get_active_request_summary()
-    print(f"Router Calls      : {summary['router']}")
-    print(f"Planner Calls     : {summary['planner']}")
-    print(f"SQL Calls         : {summary['sql_generator']}")
-    print(f"Summary Calls     : {summary['summarizer']}")
-    print(f"Report Calls      : {summary['report_formatter']}")
-    print(f"Total Calls       : {summary['total']}")
-    print(f"Prompt Tokens     : {summary['prompt_tokens']}")
-    print(f"Response Tokens   : {summary['response_tokens']}")
-    print(f"Total Tokens      : {summary['total_tokens']}")
-    print(f"Estimated Cost     : ${summary['estimated_cost']:.5f}")
-    print(f"Rate Limit Events : {summary['rate_limit_events']}")
-    print(f"Retry Attempts    : {summary['retry_attempts']}")
-    print(f"Largest Prompt    : {summary['largest_prompt_label']}")
-    print(f"Largest Prompt Tokens: {summary['largest_prompt_tokens']}")
-    print("====================================\n")
-
-    print("Prompt Leaderboard")
-    for i, (label, tokens) in enumerate(summary["leaderboard"], 1):
-        print(f"{i}. {label:<25} {tokens} tokens")
-    print("====================================\n")
-
-    gemini_metrics.end_request()
-
-    intent = agent_result.get("intent", "UNKNOWN")
-
-    # ── Handle newly created Needs Clarification ─────────────────────────────
-    if intent == "NEEDS_CLARIFICATION" and "clarification_data" in agent_result:
-        clar_data = agent_result["clarification_data"]
-        clar_data["created_at"] = time.time()
-        clar_data["attempts"] = 0
-        session["pending_clarification"] = clar_data
-        
-        print("[Phase 8.11] Clarification created.")
-        print(f"Type      : {clar_data.get('type')}")
-        print(f"Target DB : {clar_data.get('target_db')}")
-        print(f"Attempts  : 0")
-
-    # Update session context if request succeeds
-    if agent_result.get("valid", True) and intent != "NEEDS_CLARIFICATION":
-        final_db = agent_result.get("database") or target_db
-        if final_db and final_db in routing_summaries:
-            update_session(request.session_id, selected_database=final_db)
-
-    # ── Map agent result → ChatResponse ──────────────────────────────────────
-    response = ChatResponse(
-        reply=agent_result.get("reply", ""),
-        intent=intent,
-        database=agent_result.get("database", target_db),
-        sql=agent_result.get("sql"),
-        question=agent_result.get("question"),
-        valid=agent_result.get("valid", True),
-        risk_level=agent_result.get("risk_level", "SAFE"),
-        requires_confirmation=agent_result.get("requires_confirmation", False),
-        blocked_reason=agent_result.get("blocked_reason"),
-        execution=agent_result.get("execution"),
-        refresh_databases=agent_result.get("refresh_databases", False),
-        refresh_tables=agent_result.get("refresh_tables", False),
-        refresh_schema=agent_result.get("refresh_schema", False),
-    )
-
-    return response
+    finally:
+        session_id_var.reset(session_token)
+        database_name_var.reset(db_token)
+        selected_table_var.reset(table_token)
+        metadata_version_var.reset(mv_token)
+        gemini_metrics.reset_active_request()
 
 
 # ─── Phase 5: /execute-confirmed endpoint (updated) ─────────────────────────
 
 @router.post("/execute-confirmed", response_model=ChatResponse)
-async def execute_confirmed_endpoint(request: ExecuteConfirmedRequest):
+async def execute_confirmed(request: ExecuteConfirmedRequest, current_user: Any = Depends(get_current_user)):
     """
     Phase 5: Dual-Validation Execution Route.
     Phase 6: Session memory updated ONLY after successful execution.
     Called when a user confirms a HIGH_RISK or CRITICAL_RISK operation.
     """
-    meta       = get_metadata()
-    raw_schema = meta.get("schema", {})
+    from state.metadata_store import get_cache_generation
 
-    # ── Dual Validation (Security Requirement) ────────────────────────────────
-    validation = validate_sql(request.intent, request.sql, raw_schema)
+    # Phase 9.5: Enforce server-side session ownership before any work happens.
+    request.session_id = _resolve_chat_session(current_user.id, request.session_id)
 
-    if not validation["valid"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Validation failed during execution: {validation.get('failure_reason') or validation.get('blocked_reason')}"
+    session_token = session_id_var.set(request.session_id)
+    db_token = database_name_var.set(request.database)
+    mv_token = metadata_version_var.set(get_cache_generation())
+    
+    try:
+        meta       = get_metadata()
+        raw_schema = meta.get("schema", {})
+
+        # ── Dual Validation (Security Requirement) ────────────────────────────────
+        validation = validate_sql(request.intent, request.sql, raw_schema)
+
+        if not validation["valid"]:
+            try:
+                logger_audit.warning(
+                    f"Validation failed during execution confirmation: {validation.get('failure_reason') or validation.get('blocked_reason')}",
+                    extra={
+                        "category": "audit",
+                        "operation_type": "CONFIRM_EXECUTE_VALIDATION_FAILURE",
+                        "intent": request.intent,
+                        "sql": request.sql,
+                        "success": False
+                    }
+                )
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=400,
+                detail=f"Validation failed during execution: {validation.get('failure_reason') or validation.get('blocked_reason')}"
+            )
+
+        if validation["risk_level"] == "BLOCKED":
+            raise HTTPException(status_code=403, detail="Operation is blocked.")
+
+        # ── Execute ───────────────────────────────────────────────────────────────
+        from db.executor import requires_superdb
+        target_db = request.database
+        if requires_superdb(request.sql):
+            target_db = get_superdb_name()
+
+        if not target_db:
+            raise HTTPException(status_code=400, detail="No target database available for execution.")
+
+        database_name_var.set(target_db)
+
+        # Audit log confirmation start
+        try:
+            logger_audit.info(
+                f"Confirmation execution started on database '{target_db}'",
+                extra={
+                    "category": "audit",
+                    "operation_type": "CONFIRM_EXECUTION_START",
+                    "action": "execute_confirmed",
+                    "intent": request.intent,
+                    "sql": request.sql,
+                    "database_name": target_db
+                }
+            )
+        except Exception:
+            pass
+
+        execution_result = execute_sql(request.sql, target_db, intent=request.intent)
+
+        # Refresh metadata cache immediately on successful DDL execution
+        if execution_result.get("success"):
+            try:
+                logger_audit.info(
+                    f"Confirmation execution succeeded on database '{target_db}'",
+                    extra={
+                        "category": "audit",
+                        "operation_type": "CONFIRM_EXECUTION_SUCCESS",
+                        "action": "execute_confirmed",
+                        "intent": request.intent,
+                        "sql": request.sql,
+                        "database_name": target_db
+                    }
+                )
+            except Exception:
+                pass
+
+            op = execution_result.get("operation", "")
+            # Session cleanup (selected table/database tracking, DROP TABLE /
+            # RENAME TABLE / DROP DATABASE cleanup) before cache is refreshed/cleared
+            _update_session_from_execution(request.session_id, request.intent, request.sql, execution_result)
+
+            from state.metadata_store import refresh_metadata_after_ddl
+            refresh_metadata_after_ddl(request.sql, target_db, op)
+        else:
+            try:
+                logger_audit.error(
+                    f"Confirmation execution failed on database '{target_db}': {execution_result.get('error')}",
+                    extra={
+                        "category": "audit",
+                        "operation_type": "CONFIRM_EXECUTION_FAILED",
+                        "action": "execute_confirmed",
+                        "intent": request.intent,
+                        "sql": request.sql,
+                        "database_name": target_db,
+                        "error": execution_result.get("error")
+                    }
+                )
+            except Exception:
+                pass
+
+        # Build a standard ChatResponse containing only the execution result
+        response = ChatResponse(
+            reply="Execution complete.",
+            intent=request.intent,
+            database=request.database,
+            sql=request.sql,
+            valid=validation["valid"],
+            risk_level=validation["risk_level"],
+            requires_confirmation=False,
+            execution=execution_result
         )
 
-    if validation["risk_level"] == "BLOCKED":
-        raise HTTPException(status_code=403, detail="Operation is blocked.")
+        _apply_refresh_flags(response, execution_result)
 
-    # ── Execute ───────────────────────────────────────────────────────────────
-    from db.executor import requires_superdb
-    target_db = request.database
-    if requires_superdb(request.sql):
-        target_db = os.getenv("DB_SUPERDB", "postgres")
-
-    if not target_db:
-        raise HTTPException(status_code=400, detail="No target database available for execution.")
-
-    execution_result = execute_sql(request.sql, target_db)
-
-    # Refresh metadata cache immediately on successful DDL execution
-    if execution_result.get("success"):
-        op = execution_result.get("operation", "")
-        # Handle DROP DATABASE session cleanup before cache is refreshed/cleared
-        from db.executor import _clean_sql
-        cleaned_sql = _clean_sql(request.sql)
-        is_drop_db = (
-            op == "DROP DATABASE"
-            or (op == "DROP" and "DATABASE" in cleaned_sql.upper())
+        # ── Phase 6: Update session ONLY after successful execution ─────────────
+        _update_session_from_execution(
+            request.session_id, request.intent, request.sql, execution_result
         )
-        if is_drop_db:
-            match = re.search(r"DROP\s+DATABASE\s+(?:IF\s+EXISTS\s+)?([a-zA-Z0-9_\"'`]+)", cleaned_sql, re.IGNORECASE)
-            if match:
-                dropped_db = match.group(1).strip('`"\'')
-                meta = get_metadata()
-                routing_summaries = meta.get("routing_summaries", {})
-                db_tables = []
-                for d_name, t_names in routing_summaries.items():
-                    if d_name.lower() == dropped_db.lower():
-                        db_tables = t_names
-                        break
-                from state.session_store import clear_session_database
-                clear_session_database(request.session_id, dropped_db, db_tables)
 
-        from state.metadata_store import refresh_metadata_after_ddl
-        refresh_metadata_after_ddl(request.sql, target_db, op)
-
-    # Build a standard ChatResponse containing only the execution result
-    response = ChatResponse(
-        reply="Execution complete.",
-        intent=request.intent,
-        database=request.database,
-        sql=request.sql,
-        valid=validation["valid"],
-        risk_level=validation["risk_level"],
-        requires_confirmation=False,
-        execution=execution_result
-    )
-
-    _apply_refresh_flags(response, execution_result)
-
-    # ── Phase 6: Update session ONLY after successful execution ─────────────
-    _update_session_from_execution(
-        request.session_id, request.intent, request.sql, execution_result
-    )
-
-    return response
+        return response
+    finally:
+        session_id_var.reset(session_token)
+        database_name_var.reset(db_token)
+        metadata_version_var.reset(mv_token)

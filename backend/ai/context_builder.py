@@ -38,8 +38,12 @@ def build_schema_context(
             "----------------------\n\n"
         )
 
-    # ── Phase 3 — Schema / DB context (unchanged) ─────────────────────────────
-    schema_details = format_schema_for_prompt(raw_schema) if raw_schema else "None"
+    # ── Phase 3 — Schema / DB context ─────────────────────────────
+    from state.metadata_store import get_metadata
+    meta = get_metadata()
+    table_schemas = meta.get("table_schemas", {})
+    foreign_keys = meta.get("foreign_keys", {})
+    schema_details = format_schema_for_prompt(raw_schema, table_schemas=table_schemas, foreign_keys=foreign_keys) if raw_schema else "None"
 
     schema_block = (
         f"CURRENT DATABASE: {current_db or 'None'}\n"

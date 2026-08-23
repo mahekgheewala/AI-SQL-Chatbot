@@ -20,8 +20,9 @@ Identifier Validation:
   This ensures naming rules are enforced uniformly across the codebase.
 
 Type Allowlist:
-  Same whitelist as table_manager.py:
-    TEXT, INTEGER, BOOLEAN, DATE, FLOAT, TIMESTAMP
+  Shared with db/table_manager.py via db/column_types.py — a single source of
+  truth, so a type accepted here is guaranteed accepted at actual table
+  creation too.
 
 Note:
   Deep structural SQL parsing (e.g. extracting every identifier from a
@@ -33,6 +34,8 @@ Note:
 import re
 from typing import Optional
 
+from db.column_types import ALLOWED_COLUMN_TYPES, normalize_column_type
+
 # ── Intents this validator handles ────────────────────────────────────────────
 _CREATOR_INTENTS: set[str] = {
     "CREATE_DATABASE",
@@ -41,25 +44,6 @@ _CREATOR_INTENTS: set[str] = {
     "MODIFY_COLUMN",
     "RENAME_COLUMN",
     "RENAME_TABLE",
-}
-
-# ── Allowed column types (matches table_manager.py whitelist exactly) ─────────
-ALLOWED_COLUMN_TYPES: set[str] = {
-    "TEXT",
-    "INTEGER",
-    "SERIAL",       # Common PostgreSQL auto-increment type
-    "BIGINT",
-    "BOOLEAN",
-    "DATE",
-    "FLOAT",
-    "NUMERIC",
-    "DECIMAL",
-    "TIMESTAMP",
-    "VARCHAR",      # Permitted even without length — Gemini uses VARCHAR for strings
-    "CHAR",
-    "JSON",
-    "JSONB",
-    "UUID",
 }
 
 # ── Injection guard patterns ──────────────────────────────────────────────────
@@ -163,8 +147,7 @@ def check_creator_sql(intent: str, sql: Optional[str]) -> dict:
         col_type = _extract_column_type(intent, sql)
 
         if col_type is not None:
-            # Strip length specifier: VARCHAR(255) → VARCHAR
-            base_type = col_type.split("(")[0].upper()
+            base_type = normalize_column_type(col_type)
 
             if base_type not in ALLOWED_COLUMN_TYPES:
                 return {

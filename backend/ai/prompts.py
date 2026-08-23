@@ -52,6 +52,7 @@ SQL GENERATION RULES:
 2. Only use table/column names present in the SCHEMA context. Do not invent columns.
 3. For CREATE_DATABASE, you can generate it even if the schema is empty.
 4. If generating SQL is impossible or unsafe, the "sql" field must be null.
+5. SINGLE-TABLE PREFERENCE: When a single table in the schema already contains all columns needed to answer the query, query that table alone. Do NOT generate an unnecessary JOIN.
 
 EXECUTION DATABASE RESOLUTION:
 When the target database can be determined from the current user message, conversation history, or Phase 6 session memory, populate the `execution_database` field.

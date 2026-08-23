@@ -48,22 +48,23 @@ _SET_COLUMN_PATTERN = re.compile(r'["\'\`]?(\w+)["\'\`]?\s*=', re.IGNORECASE)
 def _extract_table_name(intent: str, sql: str) -> Optional[str]:
     """
     Extract the primary table name from a SQL statement based on intent.
-
-    Args:
-        intent: The Gemini-classified intent (determines which keyword to look for).
-        sql:    The SQL string.
-
-    Returns:
-        The extracted table name string, or None if extraction fails.
+    Ignores SQL function FROM clauses like EXTRACT(YEAR FROM col).
     """
     if intent == "UPDATE":
         match = _UPDATE_PATTERN.search(sql)
+        return match.group(1) if match else None
     elif intent == "INSERT":
         match = _INTO_PATTERN.search(sql)
+        return match.group(1) if match else None
     else:  # QUERY, DELETE — use FROM
-        match = _FROM_PATTERN.search(sql)
-
-    return match.group(1) if match else None
+        # Find all FROM matches and filter out function calls like EXTRACT(YEAR FROM ...)
+        matches = re.finditer(r'\bFROM\s+["\'\`]?(\w+)["\'\`]?', sql, re.IGNORECASE)
+        for m in matches:
+            prefix = sql[:m.start()].strip().upper()
+            if prefix.endswith("EXTRACT(") or prefix.endswith("SUBSTRING(") or "EXTRACT(" in prefix[-20:] or "SUBSTRING(" in prefix[-20:]:
+                continue
+            return m.group(1)
+        return None
 
 
 def _extract_set_columns(sql: str) -> list[str]:
@@ -120,10 +121,29 @@ def check_schema(intent: str, sql: Optional[str], schema: dict) -> dict:
         # Allow through — we can't validate what we can't see.
         return {"valid": True, "reason": None}
 
-    # Case-insensitive table lookup
+    # Case-insensitive table lookup and alias mapping
     schema_tables_lower = {t.lower(): t for t in schema.keys()}
+    alias_map = {}
+    for tbl_casing in schema.keys():
+        t_low = tbl_casing.lower()
+        alias_map[t_low] = tbl_casing
 
-    if table_name.lower() not in schema_tables_lower:
+    # Find table/alias definitions in FROM and JOIN
+    # e.g., FROM salaries s or JOIN departments d
+    pattern_table_alias = re.compile(
+        r'\b(?:FROM|JOIN)\s+["\'\`]?(\w+)["\'\`]?(?:\s+(?:AS\s+)?["\'\`]?(\w+)["\'\`]?)?',
+        re.IGNORECASE
+    )
+    for m in pattern_table_alias.finditer(sql):
+        t_ref = m.group(1)
+        a_ref = m.group(2)
+        if t_ref.lower() in alias_map:
+            actual_t = alias_map[t_ref.lower()]
+            alias_map[t_ref.lower()] = actual_t
+            if a_ref and a_ref.upper() not in {"ON", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "GROUP", "ORDER", "LIMIT", "SET"}:
+                alias_map[a_ref.lower()] = actual_t
+
+    if table_name.lower() not in schema_tables_lower and table_name.lower() not in alias_map:
         available = ", ".join(schema.keys()) if schema else "none"
         return {
             "valid": False,
@@ -132,6 +152,25 @@ def check_schema(intent: str, sql: Optional[str], schema: dict) -> dict:
                 f"Available tables: {available}."
             ),
         }
+
+    # Find qualified columns like alias.column or table.column
+    pattern_qual_col = re.compile(r'\b(["\'\`]?\w+["\'\`]?)\.(["\'\`]?\w+["\'\`]?)\b')
+    for m in pattern_qual_col.finditer(sql):
+        prefix = m.group(1).strip('`"\'').lower()
+        col_name = m.group(2).strip('`"\'').lower()
+
+        # If prefix is a recognized table or alias in this query
+        if prefix in alias_map:
+            actual_t = alias_map[prefix]
+            actual_cols_lower = {c.lower() for c in schema.get(actual_t, [])}
+            if col_name not in actual_cols_lower:
+                return {
+                    "valid": False,
+                    "reason": (
+                        f"Column '{m.group(2)}' does not exist in table '{actual_t}'. "
+                        f"Available columns in '{actual_t}': {', '.join(schema.get(actual_t, []))}."
+                    ),
+                }
 
     # ── For UPDATE: validate SET clause column names ──────────────────────────
     if intent == "UPDATE":
