@@ -13,16 +13,22 @@ Strict rules enforced here:
     they receive data and return text. They never touch the database.
 """
 
+
 import json
 import os
 import re
+import time
 from typing import Optional
+from dataclasses import dataclass
 
 import google.generativeai as genai
-from dotenv import load_dotenv
-
+from utils.logging_config import logger_ai
+from utils.config_loader import init_env, get_superdb_name
+from ai import model_manager
 from ai.context_builder import build_schema_context
-from ai.gemini_service import generate_sql_response
+
+init_env()
+
 from agent.gemini_retry import call_with_retry          # Phase 4.5: retry for formatters
 from agent.prompts import SUMMARIZE_PROMPT, REPORT_PROMPT
 from db.executor import execute_sql as _execute_sql, requires_superdb, extract_table_name
@@ -33,6 +39,7 @@ from state.metadata_store import (
 from state.session_store import update_session
 from validation.sql_validator import validate as validate_sql
 from agent import gemini_metrics  # Phase 8.5: call instrumentation
+from agent.ddl_parser import parse_simple_ddl
 
 # ─── Phase 4.5 Finding 1: Raw SQL intent mapper ───────────────────────────────
 # Maps the leading SQL keyword of a raw statement to the authoritative intent
@@ -107,17 +114,239 @@ def _raw_sql_intent(sql: str) -> Optional[str]:
         return "DROP_TABLE"     # conservative fallback
     return None
 
-load_dotenv()
 
-# ─── Shared Gemini formatting model (lightweight, no system prompt needed) ────
-# Separate instance so it never bleeds SQL-generation instructions.
-_fmt_model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-    generation_config=genai.types.GenerationConfig(
-        temperature=0.2,
-        response_mime_type="text/plain",
-    ),
-)
+@dataclass
+class ExecutionContext:
+    operation_type: str
+    resource_scope: str  # "SERVER", "DATABASE", "TABLE", or "NONE"
+    requires_database_context: bool
+    requires_superdb: bool
+    requires_confirmation: bool = False
+    allow_auto_routing: bool = True
+    supports_clarification: bool = True
+
+
+def build_execution_context(tool_name: str, instruction: str, user_intent: Optional[str] = None) -> ExecutionContext:
+    """
+    Constructs an ExecutionContext cleanly based on tool_name, instruction content, and user_intent,
+    raising an explicit ValueError if it cannot be determined.
+    """
+    from agent.sql_detector import is_raw_sql
+
+    instruction_clean = instruction.strip()
+    is_sql, _ = is_raw_sql(instruction_clean)
+
+    # 0. If user_intent is explicitly passed from classification layer, use it to dictate attributes
+    if user_intent and user_intent != "UNKNOWN":
+        if user_intent == "CREATE_DATABASE":
+            return ExecutionContext(
+                operation_type="CREATE_DATABASE",
+                resource_scope="SERVER",
+                requires_database_context=False,
+                requires_superdb=True,
+                requires_confirmation=False,
+                allow_auto_routing=False,
+                supports_clarification=True
+            )
+        if user_intent == "DROP_DATABASE":
+            return ExecutionContext(
+                operation_type="DROP_DATABASE",
+                resource_scope="SERVER",
+                requires_database_context=False,
+                requires_superdb=True,
+                requires_confirmation=True,
+                allow_auto_routing=False,
+                supports_clarification=True
+            )
+        if user_intent == "CREATE_TABLE":
+            return ExecutionContext(
+                operation_type="CREATE_TABLE",
+                resource_scope="DATABASE",
+                requires_database_context=True,
+                requires_superdb=False,
+                requires_confirmation=False,
+                allow_auto_routing=True,
+                supports_clarification=True
+            )
+        if user_intent == "DROP_TABLE":
+            return ExecutionContext(
+                operation_type="DROP_TABLE",
+                resource_scope="DATABASE",
+                requires_database_context=True,
+                requires_superdb=False,
+                requires_confirmation=True,
+                allow_auto_routing=True,
+                supports_clarification=True
+            )
+        if user_intent in {"ALTER_TABLE", "RENAME_TABLE"}:
+            return ExecutionContext(
+                operation_type=user_intent,
+                resource_scope="DATABASE",
+                requires_database_context=True,
+                requires_superdb=False,
+                requires_confirmation=False,
+                allow_auto_routing=True,
+                supports_clarification=True
+            )
+        if user_intent == "LIST_DATABASES":
+            return ExecutionContext(
+                operation_type="LIST_DATABASES",
+                resource_scope="SERVER",
+                requires_database_context=False,
+                requires_superdb=False,
+                requires_confirmation=False,
+                allow_auto_routing=False,
+                supports_clarification=False
+            )
+        if user_intent == "LIST_TABLES":
+            return ExecutionContext(
+                operation_type="LIST_TABLES",
+                resource_scope="DATABASE",
+                requires_database_context=True,
+                requires_superdb=False,
+                requires_confirmation=False,
+                allow_auto_routing=True,
+                supports_clarification=True
+            )
+        if user_intent == "GET_SCHEMA":
+            return ExecutionContext(
+                operation_type="GET_SCHEMA",
+                resource_scope="DATABASE",
+                requires_database_context=True,
+                requires_superdb=False,
+                requires_confirmation=False,
+                allow_auto_routing=True,
+                supports_clarification=True
+            )
+        if user_intent in {"QUERY", "INSERT", "UPDATE", "DELETE", "STANDARD_QUERY"}:
+            req_confirm = user_intent in {"DELETE", "TRUNCATE"}
+            return ExecutionContext(
+                operation_type=user_intent,
+                resource_scope="DATABASE",
+                requires_database_context=True,
+                requires_superdb=False,
+                requires_confirmation=req_confirm,
+                allow_auto_routing=True,
+                supports_clarification=True
+            )
+
+    # 1. Check if the tool_name maps to database operations
+    if tool_name == "create_database":
+        return ExecutionContext(
+            operation_type="CREATE_DATABASE",
+            resource_scope="SERVER",
+            requires_database_context=False,
+            requires_superdb=True,
+            requires_confirmation=False,
+            allow_auto_routing=False,
+            supports_clarification=True
+        )
+
+    # 2. Check for CREATE TABLE
+    if tool_name == "create_table":
+        return ExecutionContext(
+            operation_type="CREATE_TABLE",
+            resource_scope="DATABASE",
+            requires_database_context=True,
+            requires_superdb=False,
+            requires_confirmation=False,
+            allow_auto_routing=True,
+            supports_clarification=True
+        )
+
+    # 3. Check for list / schema cache-only tools
+    if tool_name == "list_databases":
+        return ExecutionContext(
+            operation_type="LIST_DATABASES",
+            resource_scope="SERVER",
+            requires_database_context=False,
+            requires_superdb=False,
+            requires_confirmation=False,
+            allow_auto_routing=False,
+            supports_clarification=False
+        )
+    if tool_name == "list_tables":
+        return ExecutionContext(
+            operation_type="LIST_TABLES",
+            resource_scope="DATABASE",
+            requires_database_context=True,
+            requires_superdb=False,
+            requires_confirmation=False,
+            allow_auto_routing=True,
+            supports_clarification=True
+        )
+    if tool_name == "get_schema_info":
+        return ExecutionContext(
+            operation_type="GET_SCHEMA",
+            resource_scope="DATABASE",
+            requires_database_context=True,
+            requires_superdb=False,
+            requires_confirmation=False,
+            allow_auto_routing=True,
+            supports_clarification=True
+        )
+
+    # 4. If it's natural language instruction, check for DB creation/deletion pattern
+    if not is_sql:
+        instr_lower = instruction_clean.lower()
+        is_create_db = bool(re.search(r"\b(create|make|build|generate|add|setup|new)\s+(?:(?:a|an|the|new|another)\s+){0,2}(?:database|db)\b", instr_lower))
+        is_drop_db = bool(re.search(r"\b(drop|delete|remove|destroy)\s+(?:(?:a|an|the|old|our)\s+){0,2}(?:database|db)\b", instr_lower))
+
+        if is_drop_db:
+            return ExecutionContext(
+                operation_type="DROP_DATABASE",
+                resource_scope="SERVER",
+                requires_database_context=False,
+                requires_superdb=True,
+                requires_confirmation=True,
+                allow_auto_routing=False,
+                supports_clarification=True
+            )
+        if is_create_db:
+            return ExecutionContext(
+                operation_type="CREATE_DATABASE",
+                resource_scope="SERVER",
+                requires_database_context=False,
+                requires_superdb=True,
+                requires_confirmation=False,
+                allow_auto_routing=False,
+                supports_clarification=True
+            )
+
+    # 5. Check for raw SQL intents
+    if is_sql:
+        raw_intent = _raw_sql_intent(instruction_clean)
+        if raw_intent is not None:
+            req_confirm = raw_intent in {"DROP_TABLE", "TRUNCATE", "DELETE", "DROP_DATABASE"}
+            is_super = (raw_intent in {"CREATE_DATABASE", "DROP_DATABASE"} or requires_superdb(instruction_clean))
+            is_server = (raw_intent in {"CREATE_DATABASE", "DROP_DATABASE"})
+            return ExecutionContext(
+                operation_type=raw_intent,
+                resource_scope="SERVER" if is_server else "DATABASE",
+                requires_database_context=not is_server,
+                requires_superdb=is_super,
+                requires_confirmation=req_confirm,
+                allow_auto_routing=True,
+                supports_clarification=True
+            )
+
+    # 6. Default mapping for execute_sql natural-language operations (always database-scoped)
+    if tool_name in {"execute_sql", "summarize_results", "generate_report"}:
+        return ExecutionContext(
+            operation_type="UNKNOWN",
+            resource_scope="DATABASE",
+            requires_database_context=True,
+            requires_superdb=False,
+            requires_confirmation=False,
+            allow_auto_routing=True,
+            supports_clarification=True
+        )
+
+    raise ValueError(f"Could not build ExecutionContext for tool '{tool_name}' and instruction '{instruction[:50]}'")
+
+
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,16 +366,21 @@ def _ensure_cached_schema(target_db: Optional[str]) -> None:
     sync_database_context(target_db)
 
 
-def _build_context(session: dict, target_db: Optional[str]) -> str:
+def _build_context(session: dict, target_db: Optional[str], target_table: Optional[str] = None, pipeline_hint: Optional[str] = None) -> str:
     """Build the dynamic schema context exactly as chat.py does."""
     meta = get_metadata()
-    return build_schema_context(
+    ctx = build_schema_context(
         current_db=target_db,
-        current_table=None,
+        current_table=target_table,
         available_dbs=meta.get("databases", []),
         raw_schema=meta.get("schema", {}),
         session=session,
     )
+    if pipeline_hint == "ANALYTICS_ENGINE":
+        ctx += "\n\n[DATA REQUIREMENT HINT: UNAGGREGATED SOURCE DATA REQUIRED]\nProduce a raw SELECT query without GROUP BY or aggregate functions (SUM, AVG, COUNT, MIN, MAX) so downstream pandas analysis can calculate exact figures on unaggregated rows."
+    elif pipeline_hint == "VISUALIZATION":
+        ctx += "\n\n[DATA REQUIREMENT HINT: VISUALIZATION DATASET REQUIRED]\nProduce a SELECT query suitable for rendering charts."
+    return ctx
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,6 +393,9 @@ def execute_sql(
     session: dict,
     session_id: Optional[str],
     history: list,
+    execution_context: Optional[ExecutionContext] = None,
+    planning_doc: Optional[dict] = None,
+    pipeline_hint: Optional[str] = None,
 ) -> dict:
     """
     Thin wrapper around the existing SQL generation + validation + execution
@@ -171,6 +408,20 @@ def execute_sql(
     """
     import re
     meta = get_metadata()
+
+    # 1. Resolve/Build ExecutionContext if not provided
+    if execution_context is None:
+        execution_context = build_execution_context("execute_sql", instruction)
+
+    # 2. Print Execution Context Log Block
+    print("\n====================================")
+    print("EXECUTION CONTEXT")
+    print("====================================")
+    print(f"\nOperation:\n{execution_context.operation_type}")
+    print(f"\nExecution Scope:\n{execution_context.resource_scope}")
+    print(f"\nRequires Active Database:\n{'YES' if execution_context.requires_database_context else 'NO'}")
+    print(f"\nRequires Super Database:\n{'YES' if execution_context.requires_superdb else 'NO'}")
+    print("\n====================================\n")
 
     # ── Check for column-less CREATE TABLE ────────────────────────────────────
     create_table_match = re.match(
@@ -231,65 +482,92 @@ def execute_sql(
             "execution": None,
         }
 
-    if not target_db:
-        if not requires_superdb(instruction):
-            dbs = sorted(meta.get("databases", []))
-            db_list = "\n".join(f"* {db}" for db in dbs)
-            return {
-                "intent": "NEEDS_CLARIFICATION",
-                "sql": None,
-                "question": (
-                    "Which database should I use?\n\n"
-                    f"{db_list}"
-                ),
-                "clarification_data": {
-                    "type": "MISSING_DATABASE",
-                    "target_db": None,
-                    "options": dbs,
-                    "original_request": instruction,
-                    "metadata": {},
-                    "attempts": 0
-                },
-                "execution_database": None,
+    # 3. If active database is required but target_db is None, prompt for database selection
+    if execution_context.requires_database_context and not target_db:
+        dbs = sorted(meta.get("databases", []))
+        db_list = "\n".join(f"* {db}" for db in dbs)
+        return {
+            "intent": "NEEDS_CLARIFICATION",
+            "sql": None,
+            "question": (
+                "Which database should I use?\n\n"
+                f"{db_list}"
+            ),
+            "clarification_data": {
+                "type": "MISSING_DATABASE",
                 "target_db": None,
-                "valid": True,
-                "risk_level": None,
-                "requires_confirmation": False,
-                "blocked_reason": None,
-                "failure_reason": None,
-                "execution": None,
-            }
+                "options": dbs,
+                "original_request": instruction,
+                "metadata": {},
+                "attempts": 0
+            },
+            "execution_database": None,
+            "target_db": None,
+            "valid": True,
+            "risk_level": None,
+            "requires_confirmation": False,
+            "blocked_reason": None,
+            "failure_reason": None,
+            "execution": None,
+        }
 
-    _ensure_cached_schema(target_db)
-    dynamic_context = _build_context(session, target_db)
-    meta = get_metadata()
+    from agent.sql_detector import is_raw_sql
+    is_sql, _ = is_raw_sql(instruction)
+    raw_intent = _raw_sql_intent(instruction.strip()) if is_sql else None
+    is_admin_cmd = execution_context.requires_superdb
+
+    if not is_admin_cmd:
+        _ensure_cached_schema(target_db)
+
+    planner_table = None
+    planner_context_block = ""
+    if planning_doc and isinstance(planning_doc, dict):
+        plan_inner = planning_doc.get("planning_document", {}) if isinstance(planning_doc.get("planning_document"), dict) else planning_doc
+        if not plan_inner.get("clarification_required", True):
+            db_context = plan_inner.get("database_context", {}) or {}
+            schema_objects = db_context.get("required_schema_objects", []) or []
+            if schema_objects:
+                planner_table = schema_objects[0]
+
+            req_elements = db_context.get("required_metadata_elements", []) or []
+            print(f"[SCHEMA RESOLUTION] Source: Groq planning_document | Tables: {schema_objects or 'None'} | Columns: {req_elements}")
+            goal = plan_inner.get("goal", "")
+            steps = plan_inner.get("execution_steps", []) or []
+
+            tables_str = ", ".join(schema_objects) if schema_objects else "None"
+            elements_str = ", ".join(req_elements) if req_elements else "None"
+            steps_str = " -> ".join(steps) if steps else "None"
+            planner_context_block = (
+                f"\n\n[LOCAL PLANNER RESOLVED CONTEXT]\n"
+                f"Resolved Target Tables: {tables_str}\n"
+                f"Resolved Elements/Columns: {elements_str}\n"
+                f"Goal: {goal}\n"
+                f"Plan Steps: {steps_str}\n"
+                f"Instruction: Use the resolved table and column references above directly for SQL generation.\n"
+            )
+
+    dynamic_context = _build_context(session, target_db if not is_admin_cmd else None, target_table=planner_table, pipeline_hint=pipeline_hint)
+    if planner_context_block:
+        dynamic_context += planner_context_block
+
 
     # ── Phase 4.5 Finding 1: Raw SQL fast-path ────────────────────────────────
     # If the instruction is already a raw SQL statement, bypass Gemini entirely.
     # Determine the intent deterministically from the leading keyword, then run
     # the normal validation → execution pipeline unchanged.
-    raw_intent = _raw_sql_intent(instruction.strip())
     if raw_intent is not None:
-        print(f"[Phase 4.5] Raw SQL detected — bypassing Gemini SQL Generator.")
-        print(f"[Phase 4.5] Inferred intent: {raw_intent}")
         intent             = raw_intent
         sql                = instruction.strip()
         question           = None
         execution_database = None
     else:
-        # ── Phase 3: Generate SQL ─────────────────────────────────────────────
-        gen_result = generate_sql_response(
-            user_input=instruction,
-            dynamic_context=dynamic_context,
-            selected_db=target_db or "None",
-            selected_table=None,
-            history=history,
-        )
+        intent             = "SQL_RETRIEVAL" if instruction.strip().upper().startswith("SELECT") else "DATABASE_MODIFICATION"
+        sql                = instruction.strip()
+        question           = None
+        execution_database = None
 
-        intent             = gen_result.get("intent", "UNKNOWN")
-        sql                = gen_result.get("sql")
-        question           = gen_result.get("question")
-        execution_database = gen_result.get("execution_database")
+    if intent == "UNKNOWN" and execution_context and execution_context.operation_type != "UNKNOWN":
+        intent = execution_context.operation_type
 
     # Build base result
     result = {
@@ -349,8 +627,8 @@ def execute_sql(
     #   1. requires_superdb(sql) — force administrative commands to DB_SUPERDB
     #   2. target_db  — resolved upstream by Router AI / explicit DB / session memory
     #   3. execution_database — returned by Gemini SQL generator as a semantic fallback
-    if requires_superdb(sql):
-        exec_db = os.getenv("DB_SUPERDB", "postgres")
+    if execution_context.requires_superdb:
+        exec_db = get_superdb_name()
     else:
         exec_db = target_db or execution_database
 
@@ -359,13 +637,13 @@ def execute_sql(
         result["failure_reason"] = "No target database resolved."
         return result
 
-    if not target_db and execution_database and not requires_superdb(sql):
+    if not target_db and execution_database and not execution_context.requires_superdb:
         print(f"\n[Phase 6.1 Bridge]")
         print(f"  Target DB      : None")
         print(f"  execution_database: {execution_database}")
         print(f"  Using execution_database fallback: {execution_database}\n")
 
-    execution_result = _execute_sql(sql, exec_db)
+    execution_result = _execute_sql(sql, exec_db, intent=intent)
     result["execution"] = execution_result
 
     # ── Phase 6: Update session ONLY on success ──────────────────────────────
@@ -423,7 +701,11 @@ def execute_sql(
     if execution_result.get("success"):
         op = execution_result.get("operation", "")
         from state.metadata_store import refresh_metadata_after_ddl
-        refresh_metadata_after_ddl(sql, target_db, op)
+        # Use exec_db (the database the SQL actually ran against), not the raw
+        # target_db parameter — target_db is often None when the database was
+        # resolved via session/execution_database fallback rather than passed
+        # explicitly, which silently skipped the schema-cache refresh below.
+        refresh_metadata_after_ddl(sql, exec_db, op, session_id=session_id)
 
     return result
 
@@ -575,27 +857,90 @@ def summarize_results(execution_result: dict) -> str:
     data_payload = json.dumps({"columns": columns, "rows": rows[:50]}, default=str)  # cap rows for token safety
     prompt = f"{SUMMARIZE_PROMPT}\n\nDATA:\n{data_payload}"
 
+    start_time = time.perf_counter()
     try:
         # Phase 8.5: record this Gemini call in the metrics tracker
         # Phase 4.5 Finding 4: use the same retry wrapper as router/planner/sql_generator
         gemini_metrics.record_call("summarizer")
         response, success, rate_limit_msg = call_with_retry(
-            fn=lambda: _fmt_model.generate_content(prompt),
+            fn=lambda: model_manager.FORMATTER_MODEL.generate_content(prompt),
             label="Summarizer",
         )
+        duration_ms = (time.perf_counter() - start_time) * 1000
+
         if not success:
             print(f"[Phase 4.5] Summarizer rate limit exhausted after retry.")
+            try:
+                logger_ai.error(
+                    f"AI Summarization failed: rate limit exhausted - {rate_limit_msg}",
+                    extra={
+                        "category": "ai",
+                        "operation_type": "SUMMARY",
+                        "intent": "SUMMARIZE_RESULTS",
+                        "success": False,
+                        "execution_time_ms": duration_ms,
+                        "error": rate_limit_msg,
+                        "model": model_manager.current_model_name()
+                    }
+                )
+            except Exception:
+                pass
             return f"Summarisation unavailable: {rate_limit_msg}"
 
+        prompt_tokens = 0
+        completion_tokens = 0
+        cost = 0.0
         if response and hasattr(response, "usage_metadata") and response.usage_metadata:
+            prompt_tokens = response.usage_metadata.prompt_token_count
+            completion_tokens = response.usage_metadata.candidates_token_count
             gemini_metrics.record_tokens(
                 "summarizer",
-                response.usage_metadata.prompt_token_count,
-                response.usage_metadata.candidates_token_count
+                prompt_tokens,
+                completion_tokens
             )
+            cost = gemini_metrics.estimate_cost(prompt_tokens, completion_tokens)
+
+        log_extra = {
+            "category": "ai",
+            "operation_type": "SUMMARY",
+            "intent": "SUMMARIZE_RESULTS",
+            "success": True,
+            "execution_time_ms": duration_ms,
+            "prompt_length": len(prompt),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "estimated_cost": cost,
+            "model": model_manager.current_model_name(),
+            "output_length": len(response.text)
+        }
+        if os.getenv("LOG_FULL_PROMPTS", "false").lower() == "true":
+            log_extra["prompt"] = prompt
+            log_extra["response_text"] = response.text
+
+        try:
+            logger_ai.info("AI Summarization completed successfully", extra=log_extra)
+        except Exception:
+            pass
 
         return response.text.strip()
     except Exception as e:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        try:
+            logger_ai.error(
+                f"AI Summarization failed with unexpected error: {str(e)}",
+                exc_info=True,
+                extra={
+                    "category": "ai",
+                    "operation_type": "SUMMARY",
+                    "intent": "SUMMARIZE_RESULTS",
+                    "success": False,
+                    "execution_time_ms": duration_ms,
+                    "error": str(e),
+                    "model": model_manager.current_model_name()
+                }
+            )
+        except Exception:
+            pass
         return f"Summarisation failed: {e}"
 
 
@@ -624,28 +969,158 @@ def generate_report(execution_result: dict) -> str:
     data_payload = json.dumps({"columns": columns, "rows": rows[:100]}, default=str)  # cap rows for token safety
     prompt = f"{REPORT_PROMPT}\n\nDATA:\n{data_payload}"
 
+    start_time = time.perf_counter()
     try:
         # Phase 8.5: record this Gemini call in the metrics tracker
         # Phase 4.5 Finding 5: use the same retry wrapper as router/planner/sql_generator
         gemini_metrics.record_call("report_formatter")
         response, success, rate_limit_msg = call_with_retry(
-            fn=lambda: _fmt_model.generate_content(prompt),
+            fn=lambda: model_manager.FORMATTER_MODEL.generate_content(prompt),
             label="Report Formatter",
         )
+        duration_ms = (time.perf_counter() - start_time) * 1000
+
         if not success:
             print(f"[Phase 4.5] Report Formatter rate limit exhausted after retry.")
+            try:
+                logger_ai.error(
+                    f"AI Report generation failed: rate limit exhausted - {rate_limit_msg}",
+                    extra={
+                        "category": "ai",
+                        "operation_type": "REPORT",
+                        "intent": "GENERATE_REPORT",
+                        "success": False,
+                        "execution_time_ms": duration_ms,
+                        "error": rate_limit_msg,
+                        "model": model_manager.current_model_name()
+                    }
+                )
+            except Exception:
+                pass
             return f"## Report\n\nReport generation unavailable: {rate_limit_msg}"
 
+        prompt_tokens = 0
+        completion_tokens = 0
+        cost = 0.0
         if response and hasattr(response, "usage_metadata") and response.usage_metadata:
+            prompt_tokens = response.usage_metadata.prompt_token_count
+            completion_tokens = response.usage_metadata.candidates_token_count
             gemini_metrics.record_tokens(
                 "report_formatter",
-                response.usage_metadata.prompt_token_count,
-                response.usage_metadata.candidates_token_count
+                prompt_tokens,
+                completion_tokens
             )
+            cost = gemini_metrics.estimate_cost(prompt_tokens, completion_tokens)
+
+        log_extra = {
+            "category": "ai",
+            "operation_type": "REPORT",
+            "intent": "GENERATE_REPORT",
+            "success": True,
+            "execution_time_ms": duration_ms,
+            "prompt_length": len(prompt),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "estimated_cost": cost,
+            "model": model_manager.current_model_name(),
+            "output_length": len(response.text)
+        }
+        if os.getenv("LOG_FULL_PROMPTS", "false").lower() == "true":
+            log_extra["prompt"] = prompt
+            log_extra["response_text"] = response.text
+
+        try:
+            logger_ai.info("AI Report generation completed successfully", extra=log_extra)
+        except Exception:
+            pass
 
         return response.text.strip()
     except Exception as e:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        try:
+            logger_ai.error(
+                f"AI Report generation failed with unexpected error: {str(e)}",
+                exc_info=True,
+                extra={
+                    "category": "ai",
+                    "operation_type": "REPORT",
+                    "intent": "GENERATE_REPORT",
+                    "success": False,
+                    "execution_time_ms": duration_ms,
+                    "error": str(e),
+                    "model": model_manager.current_model_name()
+                }
+            )
+        except Exception:
+            pass
         return f"Report generation failed: {e}"
+
+
+# Helper to print the API CALL SAVED block
+def _print_api_call_saved(operation: str, sql: str):
+    print("\n====================================")
+    print("API CALL SAVED")
+    print("====================================")
+    print(f"Operation:\n{operation}")
+    print("\nRoute:\nDeterministic")
+    print("\nGemini:\nSKIPPED")
+    print(f"\nGenerated SQL:\n{sql}")
+    print("====================================\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared DDL dispatch — try a deterministic parse of `instruction` via
+# ddl_parser first (bypassing the Gemini Executor entirely when possible),
+# falling through to execute_sql's own NL/raw-SQL handling otherwise. The
+# create/drop database and drop/alter/rename table tools all follow this same
+# shape and differ only in their log label, execution-context tool name,
+# deterministic intent label, and whether the operation requires confirmation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ddl_dispatch(
+    op_label: str,
+    context_tool_name: str,
+    deterministic_intent: str,
+    instruction: str,
+    target_db: Optional[str],
+    session: dict,
+    session_id: Optional[str],
+    history: list,
+    user_intent: Optional[str] = None,
+    requires_confirmation: bool = False,
+    parsed=None,
+) -> dict:
+    if parsed is None:
+        parsed = parse_simple_ddl(instruction, session)
+
+    if parsed and parsed.deterministic:
+        sql = parsed.sql
+        _print_api_call_saved(op_label, sql)
+
+        from agent import gemini_metrics
+        gemini_metrics.record_bypass("planner")
+
+        context = build_execution_context(context_tool_name, instruction, user_intent=deterministic_intent)
+        if requires_confirmation:
+            context.requires_confirmation = True
+        return execute_sql(
+            instruction=sql,
+            target_db=target_db,
+            session=session,
+            session_id=session_id,
+            history=history,
+            execution_context=context,
+        )
+
+    context = build_execution_context(context_tool_name, instruction, user_intent=user_intent)
+    return execute_sql(
+        instruction=instruction,
+        target_db=target_db,
+        session=session,
+        session_id=session_id,
+        history=history,
+        execution_context=context,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -658,18 +1133,30 @@ def create_database(
     session: dict,
     session_id: Optional[str],
     history: list,
+    user_intent: Optional[str] = None,
 ) -> dict:
-    """
-    Thin wrapper: delegates entirely to execute_sql().
-    The existing generate_sql_response() will generate the CREATE DATABASE statement.
-    Validation, execution, session updates, and metadata refresh all happen inside execute_sql().
-    """
-    return execute_sql(
-        instruction=instruction,
-        target_db=target_db,
-        session=session,
-        session_id=session_id,
-        history=history,
+    return _ddl_dispatch(
+        "CREATE_DATABASE", "create_database", "CREATE_DATABASE",
+        instruction, target_db, session, session_id, history, user_intent,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool 5.1 — drop_database
+# ─────────────────────────────────────────────────────────────────────────────
+
+def drop_database(
+    instruction: str,
+    target_db: Optional[str],
+    session: dict,
+    session_id: Optional[str],
+    history: list,
+    user_intent: Optional[str] = None,
+) -> dict:
+    return _ddl_dispatch(
+        "DROP_DATABASE", "execute_sql", "DROP_DATABASE",
+        instruction, target_db, session, session_id, history, user_intent,
+        requires_confirmation=True,
     )
 
 
@@ -683,18 +1170,138 @@ def create_table(
     session: dict,
     session_id: Optional[str],
     history: list,
+    user_intent: Optional[str] = None,
 ) -> dict:
-    """
-    Thin wrapper: delegates entirely to execute_sql().
-    The existing generate_sql_response() will generate the CREATE TABLE statement.
-    Validation, execution, session updates, and schema/routing refresh all happen inside execute_sql().
-    """
+    parsed = parse_simple_ddl(instruction, session)
+    if parsed:
+        if parsed.clarification_needed:
+            tbl_name = parsed.table_name
+            meta = get_metadata()
+            final_db = target_db or meta.get("selected_db") or session.get("selected_database")
+            if not final_db:
+                dbs = sorted(meta.get("databases", []))
+                db_list = "\n".join(f"* {db}" for db in dbs)
+                return {
+                    "intent": "NEEDS_CLARIFICATION",
+                    "sql": None,
+                    "question": f"Which database should I use?\n\n{db_list}",
+                    "clarification_data": {
+                        "type": "MISSING_DATABASE",
+                        "target_db": None,
+                        "options": dbs,
+                        "original_request": instruction,
+                        "metadata": {},
+                        "attempts": 0
+                    },
+                    "execution_database": None,
+                    "target_db": None,
+                    "valid": True,
+                    "risk_level": None,
+                    "requires_confirmation": False,
+                    "blocked_reason": None,
+                    "failure_reason": None,
+                    "execution": None,
+                }
+            
+            clar_type = "CREATE_TABLE_COLUMNS" if tbl_name else "CREATE_TABLE_NAME"
+            return {
+                "intent": "NEEDS_CLARIFICATION",
+                "sql": None,
+                "question": parsed.clarification_message,
+                "pending_operation": {
+                    "type": "CREATE_TABLE",
+                    "arguments": {
+                        "table_name": tbl_name,
+                        "target_db": final_db
+                    }
+                },
+                "clarification_data": {
+                    "type": clar_type,
+                    "table_name": tbl_name,
+                    "target_db": final_db,
+                    "original_request": instruction,
+                    "attempts": 0
+                },
+                "execution_database": None,
+                "target_db": final_db,
+                "valid": True,
+                "risk_level": None,
+                "requires_confirmation": False,
+                "blocked_reason": None,
+                "failure_reason": None,
+                "execution": None,
+            }
+        
+        elif parsed.deterministic:
+            return _ddl_dispatch(
+                "CREATE_TABLE", "create_table", "CREATE_TABLE",
+                instruction, target_db, session, session_id, history, user_intent,
+                parsed=parsed,
+            )
+
+    context = build_execution_context("create_table", instruction, user_intent=user_intent)
     return execute_sql(
         instruction=instruction,
         target_db=target_db,
         session=session,
         session_id=session_id,
         history=history,
+        execution_context=context,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool 6.1 — drop_table
+# ─────────────────────────────────────────────────────────────────────────────
+
+def drop_table(
+    instruction: str,
+    target_db: Optional[str],
+    session: dict,
+    session_id: Optional[str],
+    history: list,
+    user_intent: Optional[str] = None,
+) -> dict:
+    return _ddl_dispatch(
+        "DROP_TABLE", "execute_sql", "DROP_TABLE",
+        instruction, target_db, session, session_id, history, user_intent,
+        requires_confirmation=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool 6.2 — alter_table
+# ─────────────────────────────────────────────────────────────────────────────
+
+def alter_table(
+    instruction: str,
+    target_db: Optional[str],
+    session: dict,
+    session_id: Optional[str],
+    history: list,
+    user_intent: Optional[str] = None,
+) -> dict:
+    return _ddl_dispatch(
+        "ALTER_TABLE", "execute_sql", "ALTER_TABLE",
+        instruction, target_db, session, session_id, history, user_intent,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool 6.3 — rename_table
+# ─────────────────────────────────────────────────────────────────────────────
+
+def rename_table(
+    instruction: str,
+    target_db: Optional[str],
+    session: dict,
+    session_id: Optional[str],
+    history: list,
+    user_intent: Optional[str] = None,
+) -> dict:
+    return _ddl_dispatch(
+        "RENAME_TABLE", "execute_sql", "RENAME_TABLE",
+        instruction, target_db, session, session_id, history, user_intent,
     )
 
 
@@ -757,4 +1364,38 @@ def list_tables(target_db: Optional[str], session: dict) -> dict:
     return {
         "active_db": active_db,
         "tables": tables,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool 9 — find_table_database
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_table_database(message: str) -> dict:
+    """
+    Finds which database(s) contain the specified table name from the routing summaries.
+    Never queries PostgreSQL directly.
+    """
+    from agent.agent_coordinator import _FIND_TABLE_DB_RULE, _SHOW_TABLE_RULE
+    match = _SHOW_TABLE_RULE.match(message) or _FIND_TABLE_DB_RULE.match(message)
+    if not match:
+        return {
+            "intent": "FIND_TABLE_DATABASE",
+            "table_name": None,
+            "databases": [],
+        }
+    
+    table_name = match.group("table_name").strip('"`\'')
+    meta = get_metadata()
+    routing_summaries = meta.get("routing_summaries", {})
+    
+    matching_dbs = []
+    for db_name, tables in routing_summaries.items():
+        if any(t.lower() == table_name.lower() for t in tables):
+            matching_dbs.append(db_name)
+            
+    return {
+        "intent": "FIND_TABLE_DATABASE",
+        "table_name": table_name,
+        "databases": sorted(matching_dbs),
     }

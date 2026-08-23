@@ -11,21 +11,41 @@ Tracks:
   - A rolling in-memory history of the most recent 50 requests, each recording the
     ordered sequence of Gemini calls made for that request.
 
-CONCURRENCY NOTE:
-  _active_request is process-global state. This implementation is intended for local
-  development and single-process debugging only (Uvicorn with --workers=1).
-  If the application is later run with multiple concurrent workers (e.g. Uvicorn
-  --workers > 1, Gunicorn), request-scoped storage (e.g. contextvars.ContextVar)
-  should replace the global _active_request tracker. No redesign is required now —
-  this is a documentation-only note.
+CONCURRENCY NOTE (Phase 9.x):
+  The in-flight ("active") request tracker is stored in a contextvars.ContextVar.
+  Each concurrent FastAPI request runs in its own asyncio task context, so
+  simultaneous requests can no longer overwrite each other's request context —
+  a request only ever sees its OWN in-flight Gemini metrics. Previously this
+  tracker was a single process-global dict; under concurrency one request's
+  start_request() could clear and overwrite another request's in-progress
+  context mid-flight, mis-attributing calls and tokens.
+
+  The cumulative call/bypass counters and the rolling request history remain
+  process-global BY DESIGN (they aggregate across all requests) and are guarded
+  by _lock.
 """
 
 from collections import deque
 import threading
 import uuid
+from contextvars import ContextVar
 from typing import Any
 
 _lock = threading.Lock()
+
+# ── Cost estimation ────────────────────────────────────────────────────────
+# Single source of truth for Gemini pricing — was previously copy-pasted
+# across gemini_metrics.py, agent_coordinator.py, tools.py, and gemini_service.py,
+# so a pricing change (or a model change) required editing every call site.
+_PROMPT_COST_PER_TOKEN = 0.075 / 1_000_000
+_COMPLETION_COST_PER_TOKEN = 0.30 / 1_000_000
+
+
+def estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
+    """Estimated USD cost for one Gemini call, given prompt/completion token
+    counts. Pricing: $0.075/1M prompt tokens, $0.30/1M completion tokens."""
+    return (prompt_tokens * _PROMPT_COST_PER_TOKEN) + (completion_tokens * _COMPLETION_COST_PER_TOKEN)
+
 
 # ── Cumulative call counters ──────────────────────────────────────────────────
 _calls: dict[str, Any] = {
@@ -56,8 +76,10 @@ _MAX_HISTORY = 50
 _request_history: deque = deque(maxlen=_MAX_HISTORY)
 
 # ── Active request tracker ────────────────────────────────────────────────────
-# Process-global. Safe for single-worker development. See CONCURRENCY NOTE above.
-_active_request: dict = {}
+# Context-local: each request keeps its own tracker in its asyncio task context.
+# The default is an empty dict (falsy), matching the previous cleared-global
+# semantics used by end_request()/get_active_request_summary().
+_active_request: ContextVar[dict] = ContextVar("_active_request", default={})
 
 GC_MAPPING = {
     "router": "GC-01 Router",
@@ -74,21 +96,36 @@ def start_request(user_message: str) -> str:
     """
     Call at the very start of each /chat request.
 
-    Initialises the active request tracker and returns a short unique request_id
-    that can be printed in logs for correlation.
+    Initialises the active request tracker in the CURRENT request context and
+    returns a short unique request_id that can be printed in logs for correlation.
+    A ContextVar token is retained on the tracker so end_request() and
+    reset_active_request() can always reset the context (including from finally).
+
+    If the current context already has an active tracker (a nested re-instrument,
+    e.g. the pipeline path re-initialising the same request), the previous tracker
+    is replaced — matching the historical 'clear then set' behaviour.
     """
     request_id = str(uuid.uuid4())[:8]
+    ctx = {
+        "request_id": request_id,
+        "user_message": user_message[:120],   # truncate for safety
+        "calls":        [],
+        "prompt_tokens": 0,
+        "response_tokens": 0,
+        "estimated_cost": 0.0,
+        "rate_limit_events": 0,
+        "retry_attempts": 0,
+        "calls_with_tokens": [],
+        "_token": None,
+    }
     with _lock:
-        _active_request.clear()
-        _active_request["request_id"]  = request_id
-        _active_request["user_message"] = user_message[:120]   # truncate for safety
-        _active_request["calls"]        = []
-        _active_request["prompt_tokens"] = 0
-        _active_request["response_tokens"] = 0
-        _active_request["estimated_cost"] = 0.0
-        _active_request["rate_limit_events"] = 0
-        _active_request["retry_attempts"] = 0
-        _active_request["calls_with_tokens"] = []
+        prev = _active_request.get()
+        if prev:
+            prev_token = prev.get("_token")
+            if prev_token is not None:
+                _active_request.reset(prev_token)
+        token = _active_request.set(ctx)
+        ctx["_token"] = token
     return request_id
 
 
@@ -97,13 +134,14 @@ def get_active_request_summary() -> dict:
     Return call counts and estimated tokens/cost for the currently active request.
     """
     with _lock:
-        calls = list(_active_request.get("calls", []))
-        prompt_tokens = _active_request.get("prompt_tokens", 0)
-        response_tokens = _active_request.get("response_tokens", 0)
-        estimated_cost = _active_request.get("estimated_cost", 0.0)
-        rate_limit_events = _active_request.get("rate_limit_events", 0)
-        retry_attempts = _active_request.get("retry_attempts", 0)
-        calls_with_tokens = list(_active_request.get("calls_with_tokens", []))
+        active = _active_request.get()
+        calls = list(active.get("calls", []))
+        prompt_tokens = active.get("prompt_tokens", 0)
+        response_tokens = active.get("response_tokens", 0)
+        estimated_cost = active.get("estimated_cost", 0.0)
+        rate_limit_events = active.get("rate_limit_events", 0)
+        retry_attempts = active.get("retry_attempts", 0)
+        calls_with_tokens = list(active.get("calls_with_tokens", []))
         
         # Sort leaderboard descending by prompt tokens
         leaderboard = []
@@ -141,16 +179,17 @@ def end_request() -> None:
     """
     Call immediately before returning the response from /chat.
 
-    Commits the active request entry to the rolling history deque and clears
-    the active tracker for the next request.
+    Commits the active request entry to the rolling history deque and resets
+    the context-local tracker back to its default state.
     """
     with _lock:
-        if not _active_request:
+        active = _active_request.get()
+        if not active:
             return
-        prompt_t = _active_request.get("prompt_tokens", 0)
-        response_t = _active_request.get("response_tokens", 0)
-        calls = list(_active_request.get("calls", []))
-        calls_with_tokens = list(_active_request.get("calls_with_tokens", []))
+        prompt_t = active.get("prompt_tokens", 0)
+        response_t = active.get("response_tokens", 0)
+        calls = list(active.get("calls", []))
+        calls_with_tokens = list(active.get("calls_with_tokens", []))
         
         # Sort leaderboard descending by prompt tokens
         leaderboard = []
@@ -166,22 +205,24 @@ def end_request() -> None:
             largest_prompt_label, largest_prompt_tokens = "None", 0
             
         entry = {
-            "request_id":  _active_request.get("request_id", "?"),
-            "user_message": _active_request.get("user_message", ""),
+            "request_id":  active.get("request_id", "?"),
+            "user_message": active.get("user_message", ""),
             "calls":        calls,
             "total_calls":  len(calls),
             "prompt_tokens": prompt_t,
             "response_tokens": response_t,
             "total_tokens": prompt_t + response_t,
-            "estimated_cost": _active_request.get("estimated_cost", 0.0),
-            "rate_limit_events": _active_request.get("rate_limit_events", 0),
-            "retry_attempts": _active_request.get("retry_attempts", 0),
+            "estimated_cost": active.get("estimated_cost", 0.0),
+            "rate_limit_events": active.get("rate_limit_events", 0),
+            "retry_attempts": active.get("retry_attempts", 0),
             "leaderboard":      leaderboard,
             "largest_prompt_label": largest_prompt_label,
             "largest_prompt_tokens": largest_prompt_tokens,
         }
         _request_history.appendleft(entry)
-        _active_request.clear()
+        token = active.get("_token")
+        if token is not None:
+            _active_request.reset(token)
 
 
 def record_call(label: str) -> None:
@@ -194,8 +235,9 @@ def record_call(label: str) -> None:
     with _lock:
         _calls[label]    = _calls.get(label, 0) + 1
         _calls["total"]  = _calls.get("total", 0) + 1
-        if "calls" in _active_request:
-            _active_request["calls"].append(label)
+        active = _active_request.get()
+        if "calls" in active:
+            active["calls"].append(label)
 
 
 def record_tokens(label: str, prompt_tokens: int, response_tokens: int) -> None:
@@ -207,19 +249,19 @@ def record_tokens(label: str, prompt_tokens: int, response_tokens: int) -> None:
         _calls["response_tokens"] = _calls.get("response_tokens", 0) + response_tokens
         _calls["total_tokens"] = _calls.get("total_tokens", 0) + prompt_tokens + response_tokens
         
-        # Cost logic: prompt $0.075/1M, response $0.30/1M
-        cost = (prompt_tokens * 0.075 / 1_000_000) + (response_tokens * 0.30 / 1_000_000)
+        cost = estimate_cost(prompt_tokens, response_tokens)
         _calls["estimated_cost"] = _calls.get("estimated_cost", 0.0) + cost
         
-        if "prompt_tokens" in _active_request:
-            _active_request["prompt_tokens"] += prompt_tokens
-        if "response_tokens" in _active_request:
-            _active_request["response_tokens"] += response_tokens
-        if "estimated_cost" in _active_request:
-            _active_request["estimated_cost"] += cost
+        active = _active_request.get()
+        if "prompt_tokens" in active:
+            active["prompt_tokens"] += prompt_tokens
+        if "response_tokens" in active:
+            active["response_tokens"] += response_tokens
+        if "estimated_cost" in active:
+            active["estimated_cost"] += cost
             
-        if "calls_with_tokens" in _active_request:
-            _active_request["calls_with_tokens"].append((label, prompt_tokens))
+        if "calls_with_tokens" in active:
+            active["calls_with_tokens"].append((label, prompt_tokens))
 
 
 def record_rate_limit(label: str) -> None:
@@ -228,8 +270,9 @@ def record_rate_limit(label: str) -> None:
     """
     with _lock:
         _calls["rate_limit_events"] = _calls.get("rate_limit_events", 0) + 1
-        if "rate_limit_events" in _active_request:
-            _active_request["rate_limit_events"] += 1
+        active = _active_request.get()
+        if "rate_limit_events" in active:
+            active["rate_limit_events"] += 1
 
 
 def record_retry(label: str) -> None:
@@ -238,8 +281,9 @@ def record_retry(label: str) -> None:
     """
     with _lock:
         _calls["retry_attempts"] = _calls.get("retry_attempts", 0) + 1
-        if "retry_attempts" in _active_request:
-            _active_request["retry_attempts"] += 1
+        active = _active_request.get()
+        if "retry_attempts" in active:
+            active["retry_attempts"] += 1
 
 
 def record_bypass(label: str) -> None:
@@ -253,6 +297,21 @@ def record_bypass(label: str) -> None:
     with _lock:
         key = f"{label}_bypassed"
         _bypasses[key] = _bypasses.get(key, 0) + 1
+
+
+def reset_active_request() -> None:
+    """
+    Reset the current context's active-request tracker WITHOUT committing an
+    entry to the rolling history. Intended for finally blocks so an exception
+    can never leak request context into a later request.
+    """
+    with _lock:
+        active = _active_request.get()
+        if not active:
+            return
+        token = active.get("_token")
+        if token is not None:
+            _active_request.reset(token)
 
 
 def get_metrics() -> dict:
@@ -294,4 +353,8 @@ def reset_metrics() -> None:
         for k in list(_bypasses):
             _bypasses[k] = 0
         _request_history.clear()
-        _active_request.clear()
+        active = _active_request.get()
+        if active:
+            token = active.get("_token")
+            if token is not None:
+                _active_request.reset(token)
