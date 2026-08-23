@@ -1,0 +1,420 @@
+[
+  {
+    "id": "S01",
+    "category": "Setup",
+    "message": "use hr_database",
+    "status": "ERROR",
+    "ms": 0.5,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "C01",
+    "category": "CreateTable",
+    "message": "create table",
+    "status": "ERROR",
+    "ms": 0.8,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "C02",
+    "category": "CreateTable",
+    "message": "create table students",
+    "status": "ERROR",
+    "ms": 0.8,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "C03",
+    "category": "CreateTable",
+    "message": "id INTEGER, name TEXT",
+    "status": "ERROR",
+    "ms": 1.0,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "C04",
+    "category": "AddColumn",
+    "message": "add table in it",
+    "status": "ERROR",
+    "ms": 0.8,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "C05",
+    "category": "SampleData",
+    "message": "add sample data",
+    "status": "ERROR",
+    "ms": 0.5,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "R01",
+    "category": "Retrieve",
+    "message": "show employees",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "R02",
+    "category": "Retrieve",
+    "message": "show me employees in Engineering",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "R03",
+    "category": "Retrieve",
+    "message": "show me the top 5 of those",
+    "status": "ERROR",
+    "ms": 0.7,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "R04",
+    "category": "Retrieve",
+    "message": "filter them by age greater than 20",
+    "status": "ERROR",
+    "ms": 0.7,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "A01",
+    "category": "Aggregation",
+    "message": "average salary",
+    "status": "ERROR",
+    "ms": 1.0,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "V01",
+    "category": "Visualization",
+    "message": "create a pie chart",
+    "status": "ERROR",
+    "ms": 0.7,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "G01",
+    "category": "Greeting",
+    "message": "hello",
+    "status": "ERROR",
+    "ms": 0.5,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "G02",
+    "category": "Greeting",
+    "message": "thanks",
+    "status": "ERROR",
+    "ms": 1.0,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "T01",
+    "category": "Typo",
+    "message": "shw all employes",
+    "status": "ERROR",
+    "ms": 0.9,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "T02",
+    "category": "Typo",
+    "message": "lis al tabels",
+    "status": "ERROR",
+    "ms": 0.6,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "T03",
+    "category": "Typo",
+    "message": "creat employe databse",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "D01",
+    "category": "DB Mgmt",
+    "message": "show all databases",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "D02",
+    "category": "DB Mgmt",
+    "message": "show all tables",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "D03",
+    "category": "DB Mgmt",
+    "message": "describe employees",
+    "status": "ERROR",
+    "ms": 0.6,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "D04",
+    "category": "DB Mgmt",
+    "message": "switch to hr_database",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "E01",
+    "category": "Explanation",
+    "message": "explain INNER JOIN",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "E02",
+    "category": "Explanation",
+    "message": "what is GROUP BY?",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "X01",
+    "category": "CtxSwitch",
+    "message": "list all databases",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "X02",
+    "category": "CtxSwitch",
+    "message": "switch to another",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "X03",
+    "category": "CtxSwitch",
+    "message": "show students",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "X04",
+    "category": "CtxSwitch",
+    "message": "switch back to hr_database",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "X05",
+    "category": "CtxSwitch",
+    "message": "show employees",
+    "status": "ERROR",
+    "ms": 0.6,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "K01",
+    "category": "Clarify",
+    "message": "create table logs",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "K02",
+    "category": "Clarify",
+    "message": "delete records",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "K03",
+    "category": "Clarify",
+    "message": "add columns",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "S01b",
+    "category": "RawSQL",
+    "message": "SELECT * FROM employees LIMIT 3",
+    "status": "ERROR",
+    "ms": 0.4,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "L01",
+    "category": "EdgeCase",
+    "message": "show employees. Also explain JOIN.",
+    "status": "ERROR",
+    "ms": 0.8,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "L02",
+    "category": "EdgeCase",
+    "message": "$$$$$$$$",
+    "status": "ERROR",
+    "ms": 0.7,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "L03",
+    "category": "EdgeCase",
+    "message": "asdfghjkl",
+    "status": "ERROR",
+    "ms": 0.7,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "V02",
+    "category": "Conversation",
+    "message": "what can you do?",
+    "status": "ERROR",
+    "ms": 0.7,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "V03",
+    "category": "Conversation",
+    "message": "who are you?",
+    "status": "ERROR",
+    "ms": 1.0,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  },
+  {
+    "id": "F01",
+    "category": "Final",
+    "message": "show all tables",
+    "status": "ERROR",
+    "ms": 0.7,
+    "response": {
+      "error": "name 'chat_endpoint' is not defined"
+    },
+    "trace": ""
+  }
+]
