@@ -75,3 +75,13 @@ desktop.ini
 # Project specific logs and run files
 logs/
 *.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# Debug / diagnostic run output (not source)
+backend/forensic_raw_results*.json
+backend/http_baseline_25.json
+
+# Ad-hoc debugging scratchpad (not part of the shipped app)
+/scratch/
