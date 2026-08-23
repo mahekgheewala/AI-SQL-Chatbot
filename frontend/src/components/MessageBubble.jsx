@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import ResultsTable from './ResultsTable';
 import ExecutionMessage from './ExecutionMessage';
+import PlotlyChart from './PlotlyChart';
 
 /**
  * MessageBubble — renders a single chat message (user or assistant).
@@ -46,6 +47,22 @@ export default function MessageBubble({
   // Phase 5 execution state
   const hasExecution = !!message.execution;
 
+  // Phase 9.5 – Friendly error fields
+  const errorCode   = message.error_code;
+  const errorDetail = message.error_detail;
+  const hasError    = !isUser && !!errorCode && !!errorDetail;
+
+  // Category → icon mapping
+  const ERROR_ICONS = {
+    Database:      '🔴',
+    SQL:           '🟠',
+    AI:            '🟡',
+    Validation:    '🛑',
+    Clarification: '❓',
+    System:        '⚙️',
+  };
+  const errorIcon = errorDetail ? (ERROR_ICONS[errorDetail.category] || '⚠️') : '⚠️';
+
   // Derived display flags
   const isBlocked       = riskLevel === 'BLOCKED';
   const isValidFail     = !isValid && !isBlocked;
@@ -62,17 +79,85 @@ export default function MessageBubble({
             ? 'bg-blue-600 text-white rounded-br-none'
             : isClarification
             ? 'bg-amber-50 border border-amber-200 text-amber-900 rounded-bl-none shadow-sm'
+            : hasError
+            ? 'bg-gray-50 border border-gray-200 text-gray-800 rounded-bl-none shadow-sm'
             : 'bg-white border text-gray-800 rounded-bl-none shadow-sm'
         }`}
       >
+        {/* ── Phase 9.5 — Friendly Error Card ────────────────────────────────── */}
+        {hasError && (
+          <div className="mb-3 bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+            <div className={`px-4 py-3 flex items-center gap-2 ${
+              errorDetail.category === 'Database' ? 'bg-red-50 border-b border-red-100' :
+              errorDetail.category === 'SQL'      ? 'bg-orange-50 border-b border-orange-100' :
+              errorDetail.category === 'AI'       ? 'bg-yellow-50 border-b border-yellow-100' :
+              errorDetail.category === 'Validation' ? 'bg-slate-50 border-b border-slate-100' :
+                                                    'bg-gray-50 border-b border-gray-100'
+            }`}>
+              <span className="text-xl">{errorIcon}</span>
+              <div>
+                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">{errorDetail.category} Error</p>
+                <p className="text-sm font-bold text-gray-800">{errorDetail.title}</p>
+              </div>
+            </div>
+            <div className="px-4 py-3 space-y-2">
+              <p className="text-sm text-gray-700 leading-relaxed">{errorDetail.message}</p>
+              {errorDetail.suggestion && (
+                <div className="flex gap-2 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
+                  <span className="text-blue-500 text-sm mt-0.5">💡</span>
+                  <p className="text-xs text-blue-800 leading-relaxed">{errorDetail.suggestion}</p>
+                </div>
+              )}
+              {errorDetail.retry && (
+                <p className="text-xs text-gray-400 mt-1">↻ You can try rephrasing your request.</p>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* ── Message text ────────────────────────────────────────────────────── */}
         <p className="whitespace-pre-wrap text-sm">
           {isClarification && <span className="mr-1.5">❓</span>}
           {message.text}
         </p>
 
+        {/* ── Phase 10.4 — Plotly Chart rendering ─────────────────────────────── */}
+        {!isUser && message.visualization && (
+          <div className="mt-3">
+            {message.visualization.status === "SUCCESS" && message.visualization.chart ? (
+              <>
+                <PlotlyChart 
+                  data={message.visualization.chart.chart_data} 
+                  layout={message.visualization.chart.layout} 
+                />
+                {message.visualization.summary && (
+                  <p className="text-xs text-gray-600 mt-1 mb-2 leading-relaxed bg-gray-50 border border-gray-150 rounded-lg p-2.5">
+                    📊 {(() => {
+                      const parts = message.visualization.summary.split(/\*\*([^*]+)\*\*/g);
+                      return parts.map((part, idx) => 
+                        idx % 2 === 1 ? <strong key={idx} className="font-semibold text-gray-800">{part}</strong> : part
+                      );
+                    })()}
+                  </p>
+                )}
+              </>
+            ) : message.visualization.status === "NEEDS_CLARIFICATION" ? (
+              <div className="bg-amber-50 border border-amber-200 text-amber-800 p-3.5 rounded-lg text-sm mb-2 whitespace-pre-wrap leading-relaxed">
+                <span className="font-semibold text-amber-700 mb-1.5 block">📊 Clarification Needed</span>
+                {message.visualization.summary}
+              </div>
+            ) : message.visualization.status === "ERROR" ? (
+              <div className="bg-red-50 border border-red-200 text-red-800 p-3.5 rounded-lg text-sm mb-2">
+                <span className="font-semibold text-red-700 mb-1.5 block">❌ Error</span>
+                {message.visualization.summary || "Failed to generate visualization."}
+              </div>
+            ) : null}
+          </div>
+        )}
+
+
         {/* ── Phase 3 / 3.5 — Intent badge + DB badge + SQL block ─────────────── */}
-        {!isUser && message.intent && (
+        {!isUser && message.intent && message.visualization?.status !== 'NEEDS_CLARIFICATION' && (
           <div className="mt-2 pt-2 border-t border-gray-100">
             <div className="flex items-center gap-2 mb-2 flex-wrap">
               <span
