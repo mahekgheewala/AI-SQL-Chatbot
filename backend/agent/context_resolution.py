@@ -40,7 +40,7 @@ def resolve_references(frame: SemanticFrame, context: dict) -> SemanticFrame:
         if active and not frame.database:
             frame.database = active
 
-    if not frame.table and frame.action == "select" and prior_frame:
+    if not frame.table and frame.action in ("select", "visualize") and prior_frame:
         frame.table = prior_frame.table
 
     return frame

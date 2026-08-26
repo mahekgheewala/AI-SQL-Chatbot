@@ -154,9 +154,9 @@ _SEMANTIC_TOOL_MAP: dict = {
     "switch_database": "switch_database",
     "retrieve": "execute_sql",
     "raw_sql": "execute_sql",
+    "visualize": "execute_sql",
     # Capabilities below intentionally have NO tool mapping — they fall through
     # to the planner / visualization pipeline (charts, sample data, chat).
-    "visualize": None,
     "add_sample_data": None,
     "general_conversation": None,
     "understanding_failed": None,
@@ -212,6 +212,42 @@ def _tool_from_frame(frame, pipeline_hint: Optional[str], user_message: str) -> 
         try:
             result["tool"] = tool_name
             result["tool_input"] = build_sql(query_intent, target_table=frame.table)
+        except Exception:
+            result["tool"] = None
+        return result
+
+    if cap_id == "visualize":
+        # Fetches the chart's underlying data (measure aggregated by
+        # dimension) through the same validated execute_sql path as a
+        # regular retrieve. The chart spec itself (chart_type/measure/
+        # dimension) rides along on the frame for chat.py to hand to
+        # VisualizationEngine once these rows come back.
+        from agent.semantic_frame import frame_to_chart_query_intent
+        from agent.deterministic_sql_builder import build_sql, is_deterministically_executable
+        query_intent = frame_to_chart_query_intent(frame)
+        if query_intent is None:
+            return result
+        executable, _reason = is_deterministically_executable(query_intent, target_table=frame.table)
+        if not executable:
+            return result
+        try:
+            sql = build_sql(query_intent, target_table=frame.table)
+            if query_intent.aggregations:
+                # build_sql (shared with the plain "retrieve" capability,
+                # which deliberately keeps bare SUM(x)/AVG(x) — see
+                # tests/test_semantic_wiring.py) never aliases an
+                # aggregation. VisualizationEngine's own column-naming
+                # heuristic reads real signal from the result column name
+                # ("sum" vs "total_salary"), so a bare aggregate column name
+                # can make it ask for clarification on data that's otherwise
+                # perfectly chart-ready — alias it here, scoped to chart SQL
+                # only, rather than changing build_sql's general behavior.
+                agg = query_intent.aggregations[0]
+                bare = f"{agg.function}({agg.column})"
+                alias = f"{agg.function.lower()}_{agg.column}"
+                sql = sql.replace(bare, f"{bare} AS {alias}", 1)
+            result["tool"] = tool_name
+            result["tool_input"] = sql
         except Exception:
             result["tool"] = None
         return result
@@ -503,21 +539,36 @@ def run(
                 
         if plan_inner.get("clarification_required"):
             response_payload["intent"] = "NEEDS_CLARIFICATION"
-            response_payload["reply"] = plan_inner.get("clarification_question")
-            response_payload["question"] = plan_inner.get("clarification_question")
+            clarification_question = plan_inner.get("clarification_question")
+            response_payload["reply"] = clarification_question
+            response_payload["question"] = clarification_question
             response_payload["valid"] = True
             response_payload["risk_level"] = None
-            
-            db_context = plan_inner.get("database_context") or {}
-            options = db_context.get("required_schema_objects") or []
-            
-            response_payload["clarification_data"] = {
-                "type": "MISSING_DATABASE" if "database" in user_message.lower() else "AMBIGUOUS_TABLE",
-                "original_request": user_message,
-                "options": options,
-                "target_db": target_db,
-                "question": plan_inner.get("clarification_question"),
-            }
+
+            # The Planner decided clarification is needed but its Planning
+            # Document schema has no field for WHY (no missing-role concept)
+            # — classify it properly using the gateway's already-grounded
+            # frame instead of guessing between two hardcoded buckets.
+            if frame is not None:
+                from agent.semantic_frame import clarification_data_for_frame
+                from state.metadata_store import get_metadata
+                response_payload["clarification_data"] = clarification_data_for_frame(
+                    frame=frame,
+                    clarification_message=clarification_question,
+                    meta=get_metadata(),
+                    target_db=target_db,
+                    session=session,
+                    message=user_message,
+                )
+            else:
+                db_context = plan_inner.get("database_context") or {}
+                response_payload["clarification_data"] = {
+                    "type": "MISSING_DATABASE" if "database" in user_message.lower() else "GENERAL_CLARIFICATION",
+                    "original_request": user_message,
+                    "options": db_context.get("required_schema_objects") or [],
+                    "target_db": target_db,
+                    "question": clarification_question,
+                }
             return response_payload
 
     for step in range(_MAX_TOOL_CALLS):

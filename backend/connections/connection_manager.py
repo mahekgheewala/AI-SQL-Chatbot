@@ -41,6 +41,41 @@ def _load_allowed_databases(conn_model) -> set:
 
 class ConnectionManager:
     @classmethod
+    def get_allowed_databases(cls, user_id: int, db: Session) -> list[str]:
+        """
+        Phase 9.6 — Returns the properly-cased list of databases this user
+        may access: their default_database plus any explicitly granted
+        allowed_databases, deduplicated case-insensitively. Used to scope
+        "list databases" / routing to what this user actually owns, instead
+        of every database on the shared Postgres server.
+        """
+        conn_service = ConnectionService(db)
+        conn_model = conn_service.get_user_connection(user_id)
+        if not conn_model:
+            raise ValueError("No database connection configured for this user.")
+
+        seen: set = set()
+        result: list[str] = []
+        if conn_model.default_database:
+            result.append(conn_model.default_database)
+            seen.add(conn_model.default_database.lower())
+
+        raw = getattr(conn_model, "allowed_databases", None)
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                parsed = []
+            if isinstance(parsed, list):
+                for name in parsed:
+                    name = str(name)
+                    if name.lower() not in seen:
+                        result.append(name)
+                        seen.add(name.lower())
+
+        return result
+
+    @classmethod
     def get_user_execution_lock(cls, user_id: int) -> RLock:
         """
         Atomically retrieve or create a reentrant lock (RLock) for the given user_id.

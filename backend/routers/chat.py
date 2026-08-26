@@ -24,6 +24,19 @@ from utils.logging_config import (
 router = APIRouter()
 
 
+def _get_default_database(user_id: int) -> Optional[str]:
+    """The database this user connected via the setup wizard, if any."""
+    from db.app_database import SessionLocal
+    from services.connection_service import ConnectionService
+
+    db_session = SessionLocal()
+    try:
+        conn_model = ConnectionService(db_session).get_user_connection(user_id)
+        return conn_model.default_database if conn_model else None
+    finally:
+        db_session.close()
+
+
 # ─── Phase 8.4 OPT-1 + Phase 8.9: Explicit database extraction ────────────────
 
 # Patterns that indicate the user has named a database explicitly.
@@ -379,6 +392,16 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
     log_session_state(request.session_id)
 
     initial_db = session.get("selected_database")
+    # If nothing has been explicitly selected/switched to yet this session,
+    # default to the database the user actually connected (their
+    # PostgresConnection.default_database) rather than leaving every
+    # ambiguous request ("show me all tables") to fall through to a
+    # clarification prompt or an empty result.
+    if not initial_db:
+        initial_db = _get_default_database(current_user.id)
+        if initial_db:
+            update_session(request.session_id, selected_database=initial_db)
+            session["selected_database"] = initial_db
     initial_table = session.get("selected_table")
 
     db_token = database_name_var.set(initial_db)
@@ -474,6 +497,14 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
                     valid=False
                 )
 
+            # session["pending_clarification"] becomes the authoritative
+            # pending state below either way — a stale session["semantic_pending_frame"]
+            # left over from an earlier turn must not linger once it does (see
+            # the identical note at the other place this pending state gets
+            # set, further down in this function), or the next unrelated
+            # message can get silently reinterpreted as more input for an
+            # already-finished clarification.
+            session["semantic_pending_frame"] = None
             if decision.clarification_data:
                 # Frame-based clarification (agent.semantic_frame) — carries the
                 # richer options/metadata shape pending_resolution.py's resolver
@@ -523,6 +554,36 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
                     intent="CONFIRMATION",
                     database=exec_db,
                     valid=False
+                )
+
+            # Re-validate before executing — this is the resolved output of a
+            # clarification, not a re-classified message, so it never passed
+            # through the 3-gate validation pipeline any other way (mirrors
+            # /execute-confirmed's dual-validation, which this route lacked).
+            confirm_intent = clar_data.get("intent")
+            confirm_meta = get_metadata()
+            confirm_validation = validate_sql(confirm_intent, sql, confirm_meta.get("schema", {}))
+            if not confirm_validation["valid"]:
+                try:
+                    logger_audit.warning(
+                        f"Validation failed during CONFIRMATION execution: "
+                        f"{confirm_validation.get('failure_reason') or confirm_validation.get('blocked_reason')}",
+                        extra={
+                            "category": "audit",
+                            "operation_type": "CONFIRM_EXECUTE_VALIDATION_FAILURE",
+                            "intent": confirm_intent,
+                            "sql": sql,
+                            "success": False,
+                        }
+                    )
+                except Exception:
+                    pass
+                return ChatResponse(
+                    reply=f"❌ Validation failed: {confirm_validation.get('failure_reason') or confirm_validation.get('blocked_reason')}",
+                    intent="CONFIRMATION",
+                    database=exec_db,
+                    valid=False,
+                    risk_level=confirm_validation.get("risk_level"),
                 )
 
             from db.executor import execute_sql as db_execute_sql, requires_superdb
@@ -684,13 +745,33 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
         print(f"Execution Time:\n  {pipeline_duration_ms:.2f} ms")
         print("====================================\n")
 
-        # ── Handle newly created Needs Clarification ─────────────────────────────
-        if intent == "NEEDS_CLARIFICATION":
+        # ── Handle newly created Needs Clarification / Confirmation ──────────────
+        # A HIGH_RISK/CRITICAL_RISK operation ("Type CONFIRM to proceed") keeps
+        # `intent` as the actual operation (e.g. "DROP_TABLE") — not
+        # "NEEDS_CLARIFICATION" — even though it carries clarification_data and
+        # requires_confirmation=True. Without also checking that flag here, the
+        # pending state this needs for later resolution is never persisted, and
+        # typing "confirm" as a follow-up chat message can never work (the
+        # dedicated Confirm button bypasses this entirely via /execute-confirmed,
+        # which is why that path has always worked while this one silently
+        # hasn't).
+        if intent == "NEEDS_CLARIFICATION" or agent_result.get("requires_confirmation"):
             if "clarification_data" in agent_result:
                 clar_data = agent_result["clarification_data"]
                 clar_data["created_at"] = time.time()
                 clar_data["attempts"] = 0
                 session["pending_clarification"] = clar_data
+                # session["pending_clarification"] is now the single
+                # authoritative pending state going forward (universal_gateway
+                # checks it first, before ever re-interpreting a raw message).
+                # A stale semantic_pending_frame left over from this same turn
+                # (or an earlier one) must not linger — it only gets consulted
+                # when a message is interpreted fresh, which won't happen again
+                # while pending_clarification exists, but WOULD happen the next
+                # time it doesn't (e.g. once this clarification resolves) —
+                # and a leftover frame there gets treated as still-pending,
+                # hijacking the next unrelated message.
+                session["semantic_pending_frame"] = None
 
                 print("[Stage 4] Clarification created.")
                 print(f"Type      : {clar_data.get('type')}")
@@ -744,6 +825,23 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
                     target_db=target_db
                 )
 
+                # The gateway's own grounded frame — not agent_result["intent"],
+                # which reflects the underlying SQL's shape (e.g. "QUERY" for
+                # the SELECT a chart's data fetch produces) — is the source of
+                # truth for "this was a chart request".
+                _frame = getattr(decision, "semantic_frame", None)
+                if processed_res is not None and _frame is not None and _frame.capability_id == "visualize":
+                    try:
+                        from visualization.engine import VisualizationEngine
+                        viz = VisualizationEngine.generate(
+                            processed_result=processed_res,
+                            user_message=request.message,
+                            session_id=request.session_id,
+                        )
+                        visualization_result = viz.model_dump()
+                    except Exception as _viz_exc:
+                        print(f"[Visualization] Chart generation failed: {_viz_exc}")
+
             # Save classification context in session memory
             msg_count = session.get("message_count", 0) + 1
             session["message_count"] = msg_count
@@ -785,6 +883,7 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
             refresh_databases=agent_result.get("refresh_databases", False),
             refresh_tables=agent_result.get("refresh_tables", False),
             refresh_schema=agent_result.get("refresh_schema", False),
+            visualization=visualization_result,
         )
 
         return response

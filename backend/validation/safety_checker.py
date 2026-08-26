@@ -91,6 +91,26 @@ _BLOCKED_PATTERNS: list[tuple[re.Pattern, str]] = [
 # We detect it in the SQL itself and promote the risk level to CRITICAL_RISK.
 _TRUNCATE_PATTERN: re.Pattern = re.compile(r'\bTRUNCATE\b', re.IGNORECASE)
 
+# ── Multi-Statement Detection ─────────────────────────────────────────────────
+# Risk classification below (and the HIGH_RISK confirmation flow in chat.py)
+# looks only at the leading statement's intent/keyword. A second `;`-separated
+# statement would ride along at whatever risk level the first one earned and
+# execute without its own confirmation (e.g. a confirmed UPDATE smuggling an
+# unconfirmed DROP TABLE). String literals and comments are stripped first so
+# a semicolon inside a quoted value or a comment doesn't cause a false positive.
+_STRING_LITERAL_PATTERN: re.Pattern = re.compile(r"'(?:[^']|'')*'")
+_BLOCK_COMMENT_PATTERN: re.Pattern = re.compile(r'/\*.*?\*/', re.DOTALL)
+_LINE_COMMENT_PATTERN: re.Pattern = re.compile(r'--[^\n]*')
+
+
+def _has_multiple_statements(sql: str) -> bool:
+    """True if `sql` contains more than one SQL statement."""
+    stripped = _STRING_LITERAL_PATTERN.sub("''", sql)
+    stripped = _BLOCK_COMMENT_PATTERN.sub(" ", stripped)
+    stripped = _LINE_COMMENT_PATTERN.sub(" ", stripped)
+    statements = [s.strip() for s in stripped.split(";")]
+    return len([s for s in statements if s]) > 1
+
 
 def check_safety(intent: str, sql: str | None) -> dict:
     """
@@ -108,6 +128,18 @@ def check_safety(intent: str, sql: str | None) -> dict:
             "blocked_reason": str | None   (populated only when BLOCKED)
         }
     """
+
+    # ── 0. Reject multi-statement SQL ──────────────────────────────────────
+    #    No legitimate single-turn request needs more than one statement, and
+    #    allowing one lets a second statement bypass its own risk/confirmation.
+    if sql and _has_multiple_statements(sql):
+        return {
+            "risk_level": "BLOCKED",
+            "blocked_reason": (
+                "This request would execute multiple SQL statements in a single "
+                "operation, which is not permitted for safety reasons."
+            ),
+        }
 
     # ── 1. Scan SQL for permanently-blocked patterns ──────────────────────────
     if sql:

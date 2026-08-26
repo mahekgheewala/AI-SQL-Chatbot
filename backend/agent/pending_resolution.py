@@ -135,6 +135,118 @@ def _print_clarification_trace(
 
 # ─── Resolution Builders ──────────────────────────────────────────────────────
 
+def _grounding_metadata_for_pending(pending: dict) -> dict:
+    """Live grounding metadata scoped to a pending clarification's target
+    database — used only by the LLM-fallback resolvers below, which must
+    validate whatever the LLM proposes against the real schema. Explicitly
+    syncs the schema cache first (matching agent_coordinator.py's
+    _format_schema_context_for_planner convention) — a table created earlier
+    in the same conversation may not have been picked up by a passive cache
+    read yet, which would otherwise make every column on it look ungrounded."""
+    from state.metadata_store import get_metadata, sync_database_context
+    from agent.semantic_frame import build_grounding_metadata
+    target_db = pending.get("target_db")
+    if target_db:
+        try:
+            sync_database_context(target_db)
+        except Exception:
+            pass
+    return build_grounding_metadata(get_metadata(), target_db)
+
+
+def _resolve_create_table_columns_via_llm(message: str, table_name: str, pending: dict) -> Optional[dict]:
+    """LLM fallback for CREATE_TABLE_COLUMNS when is_valid_column_definition()
+    can't parse the reply as a structural column-definition list — e.g. a
+    reply naming columns in plain English rather than "name TYPE, name TYPE"
+    syntax. Returns a resolved result dict, or None if the LLM couldn't
+    extract valid columns either (caller keeps its existing "ask again"
+    behavior in that case)."""
+    from agent.clarification_resolver import resolve_create_table_slots
+
+    result = resolve_create_table_slots(
+        original_request=pending.get("original_request", ""),
+        missing=["columns"],
+        user_reply=message,
+        metadata=_grounding_metadata_for_pending(pending),
+        known_table=table_name,
+    )
+    if not result.ok or not result.columns:
+        return None
+
+    target_db = pending.get("target_db")
+    parts = [f"{c.name} {c.type or 'TEXT'}" for c in result.columns]
+    indented_parts = [f"    {p}" for p in parts]
+    cols_formatted = ",\n".join(indented_parts)
+    reconstructed = f"CREATE TABLE {table_name} (\n{cols_formatted}\n);"
+
+    orig_req = pending.get("original_request", "<unknown>")
+    _print_clarification_trace(
+        clarification_type="CREATE_TABLE_COLUMNS",
+        original_request=orig_req,
+        options=[],
+        selected_option=message.strip(),
+        reconstructed_request=reconstructed,
+        override_target_db=target_db,
+    )
+    return {
+        "resolved": True,
+        "selected_option": message.strip(),
+        "clarification_type": "CREATE_TABLE_COLUMNS",
+        "reconstructed_request": reconstructed,
+        "override_target_db": target_db,
+        "metadata": {}
+    }
+
+
+def _resolve_visualize_via_llm(message: str, pending: dict) -> Optional[dict]:
+    """LLM resolution for a chart clarification reply. Unlike every other
+    branch here, this doesn't produce a `reconstructed_request` SQL/NL
+    string — it hands back a fully-grounded chart spec that
+    agent/universal_gateway.py turns directly into a SemanticFrame, reusing
+    the same deterministic execute_sql + VisualizationEngine path a
+    one-shot, fully-specified chart request already uses. Returns None if
+    the LLM couldn't resolve it either (caller keeps its existing "ask
+    again" behavior)."""
+    from agent.clarification_resolver import resolve_chart_slots
+
+    result = resolve_chart_slots(
+        original_request=pending.get("original_request", ""),
+        user_reply=message,
+        metadata=_grounding_metadata_for_pending(pending),
+        table_hint=pending.get("table_name"),
+    )
+    if not result.ok:
+        return None
+
+    _print_clarification_trace(
+        clarification_type="MISSING_ROLE",
+        original_request=pending.get("original_request", "<unknown>"),
+        options=[],
+        selected_option=message.strip(),
+        reconstructed_request=(
+            f"VISUALIZE table={result.table} chart_type={result.chart_type} "
+            f"measure={result.measure} dimension={result.dimension} aggregation={result.aggregation}"
+        ),
+        override_target_db=pending.get("target_db"),
+    )
+    return {
+        "resolved": True,
+        "selected_option": message.strip(),
+        "clarification_type": "VISUALIZE_RESOLVED",
+        "reconstructed_request": None,
+        "override_target_db": pending.get("target_db"),
+        "metadata": {
+            "chart": {
+                "table": result.table,
+                "chart_type": result.chart_type,
+                "measure": result.measure,
+                "dimension": result.dimension,
+                "aggregation": result.aggregation,
+            }
+        }
+    }
+
+
 def _build_db_resolution_result(clar_type: str, selected: str, pending: dict) -> dict:
     orig_req = pending.get("original_request")
     _print_clarification_trace(
@@ -157,6 +269,50 @@ def _build_db_resolution_result(clar_type: str, selected: str, pending: dict) ->
 
 def _build_table_resolution_result(clar_type: str, selected: str, pending: dict) -> dict:
     orig_req = pending.get("original_request") or ""
+
+    # add_sample_data can never be reconstructed by gluing the resolved table
+    # name onto the end of the original sentence — string concatenation
+    # produces grammatically broken text ("add sample data in it books") that
+    # the downstream LLM misreads as a read request, and there is no
+    # deterministic SQL builder for INSERT to fall back on. Once a table is
+    # known, generate the actual sample data (validated against the live
+    # schema) instead.
+    if pending.get("capability_id") == "add_sample_data":
+        from agent.clarification_resolver import resolve_sample_data_request
+        result = resolve_sample_data_request(
+            original_request=orig_req,
+            user_reply=orig_req,
+            metadata=_grounding_metadata_for_pending(pending),
+            table_hint=selected,
+            row_count_hint=pending.get("sample_count"),
+        )
+        if result.ok and result.insert_sql:
+            _print_clarification_trace(
+                clarification_type=clar_type,
+                original_request=orig_req or "<unknown>",
+                options=pending.get("options", []),
+                selected_option=selected,
+                reconstructed_request=result.insert_sql,
+                override_target_db=pending.get("target_db"),
+            )
+            return {
+                "resolved": True,
+                "selected_option": selected,
+                "clarification_type": clar_type,
+                "reconstructed_request": result.insert_sql,
+                "override_target_db": pending.get("target_db"),
+                "metadata": {"selected_table": selected}
+            }
+        print(f"[Clarification] LLM could not generate sample data: {result.reason}")
+        return {
+            "resolved": False,
+            "selected_option": None,
+            "clarification_type": clar_type,
+            "reconstructed_request": None,
+            "override_target_db": None,
+            "metadata": {}
+        }
+
     reconstructed = orig_req
     if selected and selected.lower() not in orig_req.lower():
         reconstructed = f"{orig_req} {selected}"
@@ -264,7 +420,11 @@ def resolve_pending_clarification(message: str, pending: dict) -> dict:
             }
 
         if not is_valid_column_definition(message):
-            print(f"[Clarification] Invalid column definition structure: {repr(message)}")
+            print(f"[Clarification] Invalid column definition structure: {repr(message)}. Trying LLM fallback...")
+            fallback_result = _resolve_create_table_columns_via_llm(message, table_name, pending)
+            if fallback_result is not None:
+                return fallback_result
+            print("[Clarification] LLM fallback also failed to extract valid columns.")
             return {
                 "resolved": False,
                 "selected_option": None,
@@ -307,6 +467,7 @@ def resolve_pending_clarification(message: str, pending: dict) -> dict:
     if clar_type == "CONFIRMATION":
         if msg in {"confirm", "yes", "y", "ok", "proceed"}:
             sql = pending.get("metadata", {}).get("sql")
+            intent = pending.get("metadata", {}).get("intent")
             target_db = pending.get("target_db")
             _print_clarification_trace(
                 clarification_type=clar_type,
@@ -322,7 +483,7 @@ def resolve_pending_clarification(message: str, pending: dict) -> dict:
                 "clarification_type": clar_type,
                 "reconstructed_request": sql,
                 "override_target_db": target_db,
-                "metadata": {}
+                "metadata": {"intent": intent}
             }
         else:
             print("[Clarification] CONFIRMATION — user response not recognised as confirmation, resolved=False")
@@ -414,6 +575,19 @@ def resolve_pending_clarification(message: str, pending: dict) -> dict:
                 "override_target_db": pending.get("target_db"),
                 "metadata": {"table_name": tbl_name, "next_step": "CREATE_TABLE_COLUMNS"}
             }
+
+    # 4.6. MISSING_ROLE for a "visualize" capability — chart clarification
+    # ("Which column would you like to use for the pie chart?"). This is a
+    # generic label (see clarification_data_for_frame — a fully-grounded
+    # frame that the Local Planner still decided needs clarification has no
+    # more specific missing_required role to name), so it's scoped narrowly
+    # to capability_id == "visualize" here; other MISSING_ROLE cases fall
+    # through to the caller's generic "could not resolve" handling.
+    if clar_type == "MISSING_ROLE" and pending.get("capability_id") == "visualize":
+        chart_result = _resolve_visualize_via_llm(message, pending)
+        if chart_result is not None:
+            return chart_result
+        print("[Clarification] LLM chart resolution failed.")
 
     # 5. PENDING_VISUALIZATION
     if clar_type == "PENDING_VISUALIZATION":

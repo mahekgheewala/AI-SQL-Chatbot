@@ -705,14 +705,24 @@ class VisualizationEngine:
         reason: str,
         clarification_needed: bool
     ) -> None:
-        sep = "===================================="
-        print(f"\n{sep}")
-        print("VISUALIZATION DECISION")
-        print(sep)
-        print(f"Category Candidate:\n{category_candidate}\n")
-        print(f"Measure Candidate:\n{measure_candidate}\n")
-        print(f"Confidence:\n{confidence:.2f}\n")
-        print(f"Decision:\n{chart_type}\n")
-        print(f"Reason:\n{reason}\n")
-        print(f"Clarification Needed:\n{'Yes' if clarification_needed else 'No'}")
-        print(f"{sep}\n")
+        # Best-effort diagnostic logging only — must never be able to take
+        # down an otherwise-successfully-built chart. Windows consoles
+        # default to a codepage (cp1252/"charmap") that can't encode many
+        # Unicode characters (e.g. "≤"), and `reason`/candidate strings here
+        # can contain arbitrary generated text; a print() raising
+        # UnicodeEncodeError previously propagated straight out of chart
+        # generation and got the whole result discarded by the caller.
+        try:
+            sep = "===================================="
+            print(f"\n{sep}")
+            print("VISUALIZATION DECISION")
+            print(sep)
+            print(f"Category Candidate:\n{category_candidate}\n")
+            print(f"Measure Candidate:\n{measure_candidate}\n")
+            print(f"Confidence:\n{confidence:.2f}\n")
+            print(f"Decision:\n{chart_type}\n")
+            print(f"Reason:\n{reason}\n")
+            print(f"Clarification Needed:\n{'Yes' if clarification_needed else 'No'}")
+            print(f"{sep}\n")
+        except Exception:
+            pass

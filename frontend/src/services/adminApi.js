@@ -1,7 +1,8 @@
 /**
  * adminApi.js — Phase 9.5
  * API service client for all admin dashboard endpoints.
- * All endpoints are under /api/admin and require no authentication in dev mode.
+ * All endpoints are under /api/admin and require an authenticated admin JWT
+ * (see backend/routers/admin.py's get_current_admin dependency).
  */
 
 import axios from 'axios';
@@ -10,6 +11,57 @@ const adminClient = axios.create({
   baseURL: '/api/admin',
   headers: { 'Content-Type': 'application/json' },
 });
+
+adminClient.interceptors.request.use(
+  (config) => {
+    const token = localStorage.getItem('access_token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+// Silent access-token refresh on 401, mirroring services/api.js.
+let refreshInFlight = null;
+
+async function refreshAccessToken() {
+  const refreshToken = localStorage.getItem('refresh_token');
+  if (!refreshToken) {
+    throw new Error('No refresh token available');
+  }
+  const response = await axios.post('/api/auth/refresh', { refresh_token: refreshToken });
+  const { access_token, refresh_token } = response.data;
+  localStorage.setItem('access_token', access_token);
+  localStorage.setItem('refresh_token', refresh_token);
+  return access_token;
+}
+
+adminClient.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config;
+    if (error.response?.status === 401 && !originalRequest._retried) {
+      originalRequest._retried = true;
+      try {
+        if (!refreshInFlight) {
+          refreshInFlight = refreshAccessToken().finally(() => {
+            refreshInFlight = null;
+          });
+        }
+        const newAccessToken = await refreshInFlight;
+        originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
+        return adminClient(originalRequest);
+      } catch (refreshError) {
+        localStorage.removeItem('access_token');
+        localStorage.removeItem('refresh_token');
+        return Promise.reject(refreshError);
+      }
+    }
+    return Promise.reject(error);
+  }
+);
 
 /**
  * Fetch paginated, filtered log entries.

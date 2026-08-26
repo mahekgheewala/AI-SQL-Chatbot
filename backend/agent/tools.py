@@ -612,7 +612,8 @@ def execute_sql(
             "target_db": final_exec_db,
             "original_request": instruction,
             "metadata": {
-                "sql": sql
+                "sql": sql,
+                "intent": intent,
             },
             "attempts": 0
         }

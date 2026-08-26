@@ -496,6 +496,53 @@ def test_continuation_fills_columns():
     assert [c.name for c in r2.frame.columns] == ["name", "salary"]
 
 
+def test_fragment_for_pending_multiword_reply_uses_llm_fallback():
+    """Reproduces the reported bug: a multi-word reply naming BOTH the table
+    and the columns in one sentence ("name it books, and add two columns:
+    name and id") skips the single-token table check and the plain-token
+    column-harvest fallback entirely (guarded off when 'table' is still
+    missing — see _fragment_for_pending), and must resolve via the LLM
+    fallback instead. Also proves the literal word "name" survives as a real
+    column — the exact word the app's own _NON_ENTITY_WORDS blocklist would
+    otherwise silently drop."""
+    from unittest.mock import patch
+
+    metadata = {
+        "databases": ["baby_world"],
+        "active_database": "baby_world",
+        "tables": [],
+        "all_tables_by_db": {"baby_world": []},
+        "columns_by_table": {},
+        "column_types_by_table": {},
+    }
+
+    r1 = interpret_message("create a table in it", metadata, {})
+    assert r1.status == STATUS_CLARIFY
+    assert set(r1.frame.missing_required) == {"table", "columns"}
+
+    with patch("agent.local_planner._call_groq_planner") as mock_groq:
+        mock_groq.return_value = (
+            '{"table_name": "books", "columns": '
+            '[{"name": "id", "type": "INTEGER"}, {"name": "name", "type": "TEXT"}], '
+            '"confidence": 0.95}',
+            0.1,
+        )
+        r2 = interpret_message(
+            "name it books, and add two columns: name and id",
+            metadata,
+            {
+                "pending_frame": r1.frame,
+                "original_request": "create a table in it",
+            },
+        )
+
+    assert r2.status == STATUS_SUCCESS
+    assert r2.frame.capability_id == "create_table"
+    assert r2.frame.table == "books"
+    col_names = {c.name for c in r2.frame.columns}
+    assert col_names == {"id", "name"}
+
+
 def test_pronoun_resolution_uses_prior_table():
     prior = SemanticFrame(action="select", object_type="DATA",
                           capability_id="retrieve", table="employees")

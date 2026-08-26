@@ -50,12 +50,19 @@ ACTION_WORDS = {
     "create", "make", "build", "define", "setup", "set", "construct",
     "prepare", "generate", "new",
     "add", "insert", "append",
-    "alter", "modify", "change", "rename",
+    "alter", "modify", "change", "rename", "update",
     "switch", "use", "connect", "show", "display", "list", "describe", "explain",
     "plot", "chart", "graph", "visualize",
     "drop", "delete", "remove", "destroy",
     "give", "tell", "get", "see", "select", "filter", "group", "count",
 }
+
+# Value-assignment language ("give Alice a raise", "give it a discount") that
+# looks like a read request ("give me the total sales") only on the surface —
+# there is no update/delete-row capability in CAPABILITIES yet, so these must
+# fail into a clarification rather than be silently answered with a SELECT
+# (or, for delete/remove, mistaken for dropping the whole table).
+_VALUE_CHANGE_WORDS = {"raise", "bonus", "discount", "promotion", "increment", "increase", "decrease"}
 
 LEADING_POLITE = {
     "please", "can", "could", "would", "i'd", "i", "want", "need", "to",
@@ -72,6 +79,15 @@ CHART_WORDS = {
     "pie", "bar", "line", "scatter", "area", "donut", "histogram", "box",
     "funnel", "gauge", "radar",
 }
+
+# Generic chart-request nouns — distinct from CHART_WORDS (specific chart
+# *types*). A message can request a chart without naming a type at all
+# ("create a chart of sales"), so callers check both sets together.
+_GENERIC_CHART_WORDS = {"chart", "graph", "visualization", "visualisation"}
+
+
+def _is_chart_request(tokens: List[str]) -> bool:
+    return any(t in CHART_WORDS or t in _GENERIC_CHART_WORDS for t in tokens)
 
 _DDL_OPENERS = frozenset({"create", "alter", "drop", "rename"})
 
@@ -220,12 +236,18 @@ def _detect_action(tokens: List[str], message: str,
 def _resolve_action(word: str, idx: int, lead: List[str], tokens: List[str],
                     message: str, metadata: dict) -> Optional[Tuple[str, Optional[str]]]:
     if word == "create":
+        # Checked before the table/column heuristics below — "create a pie
+        # chart for column marks" contains the literal word "column" (naming
+        # the chart's dimension, not a schema change), which would otherwise
+        # misroute the whole request into CREATE TABLE.
+        if _is_chart_request(tokens):
+            return ("visualize", "CHART")
         if "database" in tokens or "db" in tokens:
             return ("create", "DATABASE")
         if "table" in tokens or "column" in tokens or "columns" in tokens or "(" in message:
             return ("create", "TABLE")
         return None
-    if word == "add":
+    if word in ("add", "insert"):
         if "sample" in tokens and "data" in tokens:
             return ("add", "DATA")
         if any(r in tokens for r in ("row", "rows", "record", "records")):
@@ -236,6 +258,13 @@ def _resolve_action(word: str, idx: int, lead: List[str], tokens: List[str],
             return ("create", "TABLE")
         if "database" in tokens or "db" in tokens:
             return ("create", "DATABASE")
+        if word == "insert":
+            # Unlike "add" (which is also used loosely for schema changes —
+            # "add a column"), a bare "insert" with no row/column/table
+            # cues is unambiguously a write; there is no insert_row
+            # capability yet, so fail into a clarification rather than
+            # falling through to the "select" catch-all below.
+            return None
         if "to" in tokens or "in" in tokens:
             return ("alter", "COLUMN")
         return None
@@ -252,7 +281,7 @@ def _resolve_action(word: str, idx: int, lead: List[str], tokens: List[str],
     if word in ("switch", "use", "connect"):
         return ("switch", "DATABASE")
     if word in ("show", "display", "list"):
-        if any(t in CHART_WORDS for t in tokens):
+        if _is_chart_request(tokens):
             return ("visualize", "CHART")
         obj = ""
         for j in range(idx + 1, len(lead)):
@@ -277,7 +306,15 @@ def _resolve_action(word: str, idx: int, lead: List[str], tokens: List[str],
         if "column" in tokens or "columns" in tokens:
             return ("alter", "COLUMN")
         return ("drop", "TABLE")
-    if word in ("give", "tell", "get", "see", "select", "filter", "group", "count", "insert"):
+    if word == "update":
+        # No update_row capability exists yet (see capabilities.py) — fail
+        # into a clarification rather than falling through to the "select"
+        # catch-all below, which would silently run a SELECT and report a
+        # requested data change as if it had succeeded.
+        return None
+    if word == "give" and any(t in _VALUE_CHANGE_WORDS for t in tokens):
+        return None
+    if word in ("give", "tell", "get", "see", "select", "filter", "group", "count"):
         return ("select", "DATA")
     return None
 
@@ -483,21 +520,75 @@ def _parse_add_sample_data(tokens: List[str], message: str) -> Tuple[Optional[in
     return count, table
 
 
-def _parse_visualize(tokens: List[str], message: str) -> ChartSpec:
+_AGG_WORD_TO_FUNCTION = {
+    "total": "SUM", "sum": "SUM",
+    "average": "AVG", "avg": "AVG", "mean": "AVG",
+    "count": "COUNT", "number": "COUNT",
+    "min": "MIN", "minimum": "MIN",
+    "max": "MAX", "maximum": "MAX",
+}
+
+
+def _parse_visualize(tokens: List[str], message: str, metadata: dict,
+                     context_table_hint: Optional[str] = None) -> Tuple[ChartSpec, Optional[str]]:
+    """Parse a chart request and resolve its table. Returns (ChartSpec, table)
+    — table is returned separately (not just via the caller's own loop) since
+    the raw measure/dimension words below must be excluded from table
+    candidacy first (the same "salary" vs "salaries" conflation the retrieve
+    capability guards against — see _filter_reference_words)."""
     chart_type = None
-    dimension = None
-    measure = None
+    dimension_word = None
+    measure_word = None
+    aggregation = None
+
     for t in tokens:
         if t in CHART_WORDS:
             chart_type = t
             break
-    m = re.search(r"\bby\s+([a-z_]+)\s*$", message.lower())
+
+    text = message.lower()
+    m = re.search(r"\bby\s+([a-z_]+)\s*$", text)
     if m:
-        dimension = m.group(1)
-    m2 = re.search(r"\b(?:total\s+|average\s+|avg\s+)?([a-z_]+)\s+by\s+", message.lower())
+        dimension_word = m.group(1)
+    m2 = re.search(r"\b(?:(total|average|avg|mean|count|number|min|minimum|max|maximum)\s+)?([a-z_]+)\s+by\s+", text)
     if m2:
-        measure = m2.group(1)
-    return ChartSpec(chart_type=chart_type, dimension=dimension, measure=measure)
+        if m2.group(1):
+            aggregation = _AGG_WORD_TO_FUNCTION.get(m2.group(1))
+        measure_word = m2.group(2)
+
+    # Only exclude dimension/measure words that actually ground as a real
+    # column somewhere — "employees" in "chart of employees by department"
+    # is the table noun, not a measure column, and must stay eligible for
+    # table matching below even though it sits in the "X by Y" measure slot.
+    exclude = {
+        w for w in (dimension_word, measure_word)
+        if w and G.ground_column(w, metadata, table=None) is not None
+    }
+    exclude |= _filter_reference_words(message)
+
+    table = None
+    for tok in tokens:
+        if tok in exclude:
+            continue
+        tbl = G.ground_table(tok, metadata, allow_fresh=False)
+        if tbl:
+            table = tbl
+            break
+    if not table:
+        for tok in tokens:
+            if tok in exclude:
+                continue
+            inferred = G.find_table_for_column(tok, metadata)
+            if inferred:
+                table = inferred
+                break
+    attr_table = table or context_table_hint
+
+    measure = G.ground_column(measure_word, metadata, table=attr_table) if measure_word else None
+    dimension = G.ground_column(dimension_word, metadata, table=attr_table) if dimension_word else None
+
+    return ChartSpec(chart_type=chart_type, dimension=dimension, measure=measure,
+                     aggregation=aggregation), table
 
 
 def _parse_filters(message: str) -> List[Tuple[str, str, str]]:
@@ -566,14 +657,51 @@ def _parse_comparative_filters(message: str, table: Optional[str],
     return [], False
 
 
-def _parse_retrieve(tokens: List[str], message: str, metadata: dict) -> dict:
+def _filter_reference_words(message: str) -> set:
+    """Words used as the referenced attribute in a comparative/filter clause
+    ("salary above 110000", "with status = active"). These name a column,
+    never a table — even when the word also happens to alias-match a table
+    name (e.g. singular "salary" aliasing the plural "salaries" table via
+    EntityResolver's pluralization rules). Used to keep the table-grounding
+    loop below from mistaking a filtered-on column for a table switch."""
+    text = message.lower()
+    words = set()
+
+    for op_re, op, implicit_word in _COMPARATIVE_OPS:
+        m = op_re.search(text)
+        if not m or implicit_word:
+            continue
+        before = text[:m.start()].strip()
+        head_tokens = re.findall(r"[a-z_][a-z0-9_]*", before)
+        if head_tokens:
+            words.add(head_tokens[-1])
+
+    for pattern in (
+        r"\bin\s+(?:the\s+)?[a-z_][a-z0-9_]*\s+(?P<col>[a-z_]+)\s*$",
+        r"\b(?P<col>[a-z_]+)\s+(?:is|are|was|were|has|have)\s+(?:been\s+)?(?:greater than|more than|over)\s+\d+",
+        r"\b(?P<col>[a-z_]+)\s+(?:greater than|less than|over|more than|>\s*)\s*\d+",
+        r"\bwhere\s+(?P<col>[a-z_]+)\s*(?:=|!=|>|<|>=|<=)",
+        r"\b(?:with|having)\s+(?P<col>[a-z_]+)\s*(?:=|\bis\b|\bare\b)",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            words.add(m.group("col"))
+
+    return words
+
+
+def _parse_retrieve(tokens: List[str], message: str, metadata: dict,
+                    context_table_hint: Optional[str] = None) -> dict:
     roles: dict = {
         "table": None, "columns": [], "filters": [], "limit": None,
         "group_by": [], "aggregations": [], "ordering": [],
         "_unresolved_attribute": False,
     }
 
+    filter_words = _filter_reference_words(message)
     for tok in tokens:
+        if tok in filter_words:
+            continue
         tbl = G.ground_table(tok, metadata, allow_fresh=False)
         if tbl:
             roles["table"] = tbl
@@ -638,7 +766,15 @@ def _parse_retrieve(tokens: List[str], message: str, metadata: dict) -> dict:
 
     roles["filters"] = _parse_filters(message)
 
-    comp_filters, comp_ambiguous = _parse_comparative_filters(message, roles["table"], metadata)
+    # When this message doesn't name its own table, resolve filter/superlative
+    # attribute words against the prior turn's table (context_table_hint) —
+    # otherwise a word that's a column on multiple tables (e.g. "salary" on
+    # both "employees" and "salaries") looks ambiguous even though the
+    # conversation has already established which table is meant. The final
+    # `roles["table"]` is left None either way; context_resolution still fills
+    # it in from the prior frame afterward.
+    attr_table = roles["table"] or context_table_hint
+    comp_filters, comp_ambiguous = _parse_comparative_filters(message, attr_table, metadata)
     if comp_filters:
         roles["filters"].extend(comp_filters)
     elif comp_ambiguous:
@@ -667,9 +803,9 @@ def _parse_retrieve(tokens: List[str], message: str, metadata: dict) -> dict:
             after_tokens = [t for t in re.findall(r"[a-z_][a-z0-9_]*", after_text)
                             if t not in _SUPERLATIVE_SKIP_WORDS]
             attr_word = after_tokens[0] if after_tokens else sup_word
-            col, ambiguous = G.resolve_attribute_word(attr_word, roles["table"], metadata)
+            col, ambiguous = G.resolve_attribute_word(attr_word, attr_table, metadata)
             if not col and attr_word != sup_word:
-                col, ambiguous = G.resolve_attribute_word(sup_word, roles["table"], metadata)
+                col, ambiguous = G.resolve_attribute_word(sup_word, attr_table, metadata)
             if col:
                 is_agg_only_word = sup_word in {"average", "avg", "mean", "total", "sum"}
                 if (is_scalar or is_agg_only_word) and sup_word in _SUPERLATIVE_SCALAR_AGG:
@@ -728,7 +864,7 @@ def interpret_message(message: str, metadata: dict, context: dict = None) -> Fra
     # (which would otherwise look like a stray retrieve request).
     pending = context.get("pending_frame")
     if pending is not None and pending.capability_id == "create_table":
-        fragment = _fragment_for_pending(tokens, msg, context)
+        fragment = _fragment_for_pending(tokens, msg, context, metadata)
         if fragment is not None:
             return _finish(fragment, metadata, context, reason="continuation")
 
@@ -739,7 +875,7 @@ def interpret_message(message: str, metadata: dict, context: dict = None) -> Fra
             frame = SemanticFrame(action="converse", capability_id="general_conversation",
                                   source="SEMANTIC_FRAME")
             return _finish(frame, metadata, context, reason="greeting")
-        fragment = _fragment_for_pending(tokens, msg, context)
+        fragment = _fragment_for_pending(tokens, msg, context, metadata)
         if fragment is not None:
             return _finish(fragment, metadata, context, reason="continuation")
         frame = SemanticFrame(action="none", capability_id="understanding_failed",
@@ -747,7 +883,9 @@ def interpret_message(message: str, metadata: dict, context: dict = None) -> Fra
         return _finish(frame, metadata, context, reason="no action")
 
     action_word, object_type = action
-    frame = _build_frame(action_word, object_type, tokens, msg, metadata)
+    prior = context.get("prior_frames") or []
+    context_table_hint = prior[-1].table if prior else None
+    frame = _build_frame(action_word, object_type, tokens, msg, metadata, context_table_hint)
     if frame is None:
         frame = SemanticFrame(action="none", capability_id="understanding_failed",
                               source="SEMANTIC_FRAME")
@@ -760,13 +898,15 @@ def interpret_message(message: str, metadata: dict, context: dict = None) -> Fra
 
 
 def _fragment_for_pending(tokens: List[str], message: str,
-                          context: dict) -> Optional[SemanticFrame]:
+                          context: dict, metadata: dict = None) -> Optional[SemanticFrame]:
     pending = context.get("pending_frame")
     if pending is None:
         return None
     if pending.capability_id != "create_table":
         return None
     missing = pending.missing_required or []
+
+    # Fast path: single-token table name.
     if "table" in missing and len(tokens) == 1:
         cand = tokens[0]
         if G.is_identifier(cand) and not G.is_non_entity(cand) and not G.is_pronoun(cand):
@@ -775,18 +915,53 @@ def _fragment_for_pending(tokens: List[str], message: str,
             frame.is_clarification_response = True
             frame.missing_required = [r for r in missing if r != "table"]
             return frame
-    cols = _column_list_from_fragment(tokens, message)
-    if cols:
-        frame = pending.model_copy(deep=True)
-        frame.columns = cols
-        frame.is_clarification_response = True
-        frame.missing_required = [r for r in missing if r != "columns"]
-        return frame
+
+    # Fast path: column list via parens / "with columns" marker / plain-token
+    # fallback. Only trusted when a table name isn't ALSO still missing —
+    # this fallback can't distinguish "the table name" from "a column name"
+    # in the same reply (a multi-word reply naming both, e.g. "name it books,
+    # and add two columns: name and id", needs the LLM fallback below to
+    # resolve both slots from one completion instead of guessing).
+    if "table" not in missing:
+        cols = _column_list_from_fragment(tokens, message)
+        if cols:
+            frame = pending.model_copy(deep=True)
+            frame.columns = cols
+            frame.is_clarification_response = True
+            frame.missing_required = [r for r in missing if r != "columns"]
+            return frame
+
+    # Fast paths couldn't cleanly resolve what's still missing — fall back
+    # to LLM-based extraction with full context (original request + this
+    # reply + live schema), then validate whatever it proposes against the
+    # real schema before trusting it.
+    if missing:
+        from agent.clarification_resolver import resolve_create_table_slots
+        result = resolve_create_table_slots(
+            original_request=context.get("original_request") or "",
+            missing=missing,
+            user_reply=message,
+            metadata=metadata or {},
+            known_table=pending.table,
+        )
+        if result.ok and (result.table_name or result.columns):
+            frame = pending.model_copy(deep=True)
+            if result.table_name and "table" in missing:
+                frame.table = result.table_name
+            if result.columns and "columns" in missing:
+                frame.columns = result.columns
+            frame.is_clarification_response = True
+            frame.missing_required = [
+                r for r in missing
+                if not (r == "table" and frame.table) and not (r == "columns" and frame.columns)
+            ]
+            return frame
     return None
 
 
 def _build_frame(action_word: str, object_type: Optional[str], tokens: List[str],
-                 message: str, metadata: dict) -> Optional[SemanticFrame]:
+                 message: str, metadata: dict,
+                 context_table_hint: Optional[str] = None) -> Optional[SemanticFrame]:
     cap = capability_for(action_word, object_type)
     if cap is None:
         return None
@@ -816,12 +991,7 @@ def _build_frame(action_word: str, object_type: Optional[str], tokens: List[str]
         frame.table = table
         frame.sample_data = SampleDataSpec(count=count, table=table)
     elif cap.id == "visualize":
-        frame.chart = _parse_visualize(tokens, message)
-        for tok in tokens:
-            tbl = G.ground_table(tok, metadata, allow_fresh=False)
-            if tbl:
-                frame.table = tbl
-                break
+        frame.chart, frame.table = _parse_visualize(tokens, message, metadata, context_table_hint)
     elif cap.id == "switch_database":
         frame.database = _after_marker(tokens, ("database", "db"))
         if frame.database is None:
@@ -833,7 +1003,7 @@ def _build_frame(action_word: str, object_type: Optional[str], tokens: List[str]
     elif cap.id == "describe_table":
         frame.table = _after_marker(tokens, ("describe", "explain", "table"))
     elif cap.id == "retrieve":
-        roles = _parse_retrieve(tokens, message, metadata)
+        roles = _parse_retrieve(tokens, message, metadata, context_table_hint)
         frame.table = roles["table"]
         frame.columns = [ColumnSpec(name=c) for c in roles["columns"]]
         frame.filters = [
@@ -1063,6 +1233,7 @@ def build_context(session: dict, active_db: Optional[str] = None) -> dict:
         "pending_frame": session.get("semantic_pending_frame"),
         "prior_frames": session.get("semantic_prior_frames") or [],
         "active_database": active_db,
+        "original_request": session.get("semantic_pending_original_request"),
     }
 
 
@@ -1087,6 +1258,52 @@ def frame_to_query_intent(frame: SemanticFrame) -> Optional[QueryIntent]:
         aggregations=list(frame.aggregations or []),
         grouping=list(frame.group_by or []),
     )
+
+
+def frame_to_chart_query_intent(frame: SemanticFrame) -> Optional[QueryIntent]:
+    """Build a deterministic-SQL-builder-ready QueryIntent that fetches the
+    data a chart needs: the measure aggregated by dimension when both are
+    grounded, or the bare measure column otherwise (e.g. a histogram)."""
+    if not frame.table or not frame.chart or not frame.chart.measure:
+        return None
+    chart = frame.chart
+    if chart.dimension:
+        aggregation = chart.aggregation
+        if not aggregation:
+            # A dimension means this WILL be aggregated — defaulting a
+            # non-numeric measure (e.g. a grade/category stored as text) to
+            # SUM/AVG would build SQL Postgres rejects outright ("function
+            # sum(text) does not exist"). COUNT works on any column type and
+            # is usually what's actually wanted for a non-numeric measure
+            # ("how many rows per category").
+            aggregation = "SUM" if _is_numeric_column(frame.table, chart.measure) else "COUNT"
+        return QueryIntent(
+            operation="SELECT",
+            entities=QueryEntities(database=frame.database, tables=[frame.table]),
+            constraints=QueryConstraints(),
+            aggregations=[QueryAggregation(function=aggregation, column=chart.measure)],
+            grouping=[chart.dimension],
+        )
+    return QueryIntent(
+        operation="SELECT",
+        entities=QueryEntities(database=frame.database, tables=[frame.table], columns=[chart.measure]),
+        constraints=QueryConstraints(limit=1000),
+    )
+
+
+def _is_numeric_column(table: str, column: str) -> bool:
+    """Best-effort live-schema type check — fails open (treats an unknown
+    type as numeric, preserving today's SUM-by-default behavior) so a
+    metadata-cache miss never blocks a chart that would have worked."""
+    try:
+        from state.metadata_store import get_metadata
+        meta = get_metadata()
+        col_type = (meta.get("table_schemas") or {}).get(table, {}).get(column)
+        if col_type is None:
+            return True
+        return any(h in str(col_type).upper() for h in G._NUMERIC_TYPE_HINTS)
+    except Exception:
+        return True
 
 
 def instruction_for_frame(frame: SemanticFrame, message: str) -> str:
@@ -1119,6 +1336,13 @@ def instruction_for_frame(frame: SemanticFrame, message: str) -> str:
         return message
     if cap_id == "describe_table" and frame.table:
         return f"describe table {frame.table}"
+    if cap_id == "raw_sql" and frame.raw_sql:
+        # The frame's own raw_sql is authoritative here — `message` can be
+        # stale/mismatched when this frame came from a reconstructed
+        # clarification reply that was re-classified (routers/chat.py always
+        # passes the ORIGINAL user-typed text into the handler, not the
+        # reconstructed one the gateway actually classified this frame from).
+        return frame.raw_sql
     return message
 
 
@@ -1142,7 +1366,14 @@ def clarification_data_for_frame(frame: SemanticFrame, clarification_message: Op
         "question": question,
         "attempts": 0,
         "metadata": {},
+        "capability_id": frame.capability_id,
     }
+    if frame.table:
+        # Surfaced regardless of clarification type — any LLM-backed resolver
+        # for the pending state (e.g. a chart clarification) benefits from
+        # knowing the table was already grounded, even when the specific
+        # clar_type branch below doesn't itself need it.
+        clar_data["table_name"] = frame.table
     if frame.capability_id == "create_table":
         if "table" in missing:
             clar_type = "CREATE_TABLE_NAME"
@@ -1150,6 +1381,11 @@ def clarification_data_for_frame(frame: SemanticFrame, clarification_message: Op
             clar_type = "CREATE_TABLE_COLUMNS"
             if frame.table:
                 clar_data["table_name"] = frame.table
+    elif frame.capability_id == "add_sample_data" and frame.sample_data and frame.sample_data.count:
+        clar_data["sample_count"] = frame.sample_data.count
+        if "table" in missing:
+            clar_type = "MISSING_TABLE"
+            clar_data["options"] = tables
     elif "database" in missing:
         clar_type = "MISSING_DATABASE"
         clar_data["options"] = dbs

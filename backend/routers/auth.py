@@ -91,8 +91,15 @@ def verify_email(token: str = Query(...), db: Session = Depends(get_db)):
 
 @router.post("/forgot-password")
 def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(get_db)):
-    auth_service = AuthenticationService(db)
-    auth_service.forgot_password(str(request.email))
+    # Rate-limited per email (separate namespace from login's identifier) so
+    # this can't be used to email-bomb an address with reset links. Silently
+    # skipped once limited rather than returning 429 — a differing response
+    # would itself be an account-enumeration/timing side channel.
+    identifier = f"forgot_password:{request.email}"
+    if not is_rate_limited(identifier):
+        record_failure(identifier)
+        auth_service = AuthenticationService(db)
+        auth_service.forgot_password(str(request.email))
     # Always return the same generic message (no account enumeration).
     return {"message": "If that email is registered, a password reset link has been sent."}
 

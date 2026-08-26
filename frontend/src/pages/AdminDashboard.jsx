@@ -10,7 +10,9 @@
  *   ⬇️ Export       — Download logs as JSON or CSV
  * 
  * Linked from the Chat UI header with a small icon button.
- * Unprotected in dev — Phase 10 adds JWT auth.
+ * Route-guarded by ProtectedRoute + an ADMIN/SUPER_ADMIN role check (App.jsx);
+ * adminApi.js attaches the JWT so the backend's get_current_admin dependency
+ * (routers/admin.py) accepts the requests.
  */
 
 import React, { useState } from 'react';

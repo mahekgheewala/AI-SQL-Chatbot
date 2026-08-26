@@ -393,7 +393,14 @@ class TestPlannerIntegration(unittest.TestCase):
         self.assertEqual(res["question"], "What columns?")
         self.assertTrue(res["valid"])
         self.assertIsNone(res["risk_level"])
-        self.assertEqual(res["clarification_data"]["type"], "AMBIGUOUS_TABLE")
+        # "Please create a new table invoices" is understood cleanly (table
+        # name grounded, no table ambiguity at all) — only columns are
+        # missing, so the correct classification is CREATE_TABLE_COLUMNS,
+        # not a guessed AMBIGUOUS_TABLE. This assertion was deliberately
+        # updated as part of fixing the crude 2-bucket clarification-type
+        # guess in agent_coordinator.py (see docs/errors_and_solutions.md).
+        self.assertEqual(res["clarification_data"]["type"], "CREATE_TABLE_COLUMNS")
+        self.assertEqual(res["clarification_data"]["capability_id"], "create_table")
 
         # Gemini should not have been called at all
         mock_gemini.assert_not_called()

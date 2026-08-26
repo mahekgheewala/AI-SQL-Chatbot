@@ -65,9 +65,16 @@ def process_universal_semantic_gateway(
         session["semantic_prior_frames"] = (prior + [frame])[-10:]
 
     if frame_result.status == semantic_frame.STATUS_CLARIFY:
+        # Only capture the ORIGINAL request that started this clarification
+        # thread the first time — a still-unresolved follow-up reply must
+        # not overwrite it, or _fragment_for_pending's LLM fallback loses
+        # the context it needs across multiple clarification turns.
+        if not session.get("semantic_pending_frame"):
+            session["semantic_pending_original_request"] = raw_message
         session["semantic_pending_frame"] = frame
     elif frame_result.status == semantic_frame.STATUS_SUCCESS:
         session["semantic_pending_frame"] = None
+        session["semantic_pending_original_request"] = None
 
     result = semantic_frame.frame_result_to_understanding(frame_result, raw_message, cleaned_msg)
 
@@ -446,7 +453,17 @@ def decide(
                         target_db=resolve.get("override_target_db"),
                         needs_clarification=False,
                         clarification_type="CONFIRMATION",
-                        clarification_data=resolve,
+                        # NOTE: shape must match the CREATE_TABLE_COLUMNS case
+                        # below ("sql" key, not "reconstructed_request") —
+                        # routers/chat.py's CONFIRMATION handler reads
+                        # clarification_data["sql"]. Passing the raw `resolve`
+                        # dict through here previously left this path always
+                        # failing with "No SQL to execute from the confirmation."
+                        clarification_data={
+                            "sql": resolve.get("reconstructed_request"),
+                            "target_db": resolve.get("override_target_db"),
+                            "intent": (resolve.get("metadata") or {}).get("intent"),
+                        },
                         requires_db_connection=True,
                         reason="Pending CONFIRMATION resolved — SQL ready to execute.",
                     )
@@ -500,10 +517,50 @@ def decide(
                         clarification_data={
                             "sql": _sql,
                             "target_db": _db,
+                            "intent": "CREATE_TABLE",
                         },
                         requires_db_connection=True,
                         reason="Pending CREATE_TABLE_COLUMNS resolved — SQL ready to execute.",
                     )
+
+                # ── VISUALIZE_RESOLVED: chart clarification resolved ──────────
+                # Unlike the SQL-reconstruction branches, this doesn't have SQL
+                # text to re-classify — it has a fully-grounded chart spec.
+                # Build the same SemanticFrame a one-shot, fully-specified
+                # chart request would have produced, and run it through the
+                # normal success path (_finalize_decision) so it reaches
+                # agent_coordinator.py's existing "visualize" capability
+                # dispatch (deterministic execute_sql + VisualizationEngine) —
+                # the exact path a complete chart request already uses.
+                if resolve["clarification_type"] == "VISUALIZE_RESOLVED":
+                    from models.schemas import SemanticFrame, ChartSpec
+                    from agent.semantic_frame import FrameResult, STATUS_SUCCESS, frame_result_to_understanding
+
+                    chart_info = (resolve.get("metadata") or {}).get("chart") or {}
+                    resolved_frame = SemanticFrame(
+                        action="visualize",
+                        object_type="CHART",
+                        capability_id="visualize",
+                        legacy_intent="VISUALIZE",
+                        source="SEMANTIC_FRAME",
+                        table=chart_info.get("table"),
+                        chart=ChartSpec(
+                            chart_type=chart_info.get("chart_type"),
+                            measure=chart_info.get("measure"),
+                            dimension=chart_info.get("dimension"),
+                            aggregation=chart_info.get("aggregation"),
+                        ),
+                    )
+                    session["pending_clarification"] = None
+                    frame_result = FrameResult(
+                        frame=resolved_frame, status=STATUS_SUCCESS,
+                        capability_id="visualize", reason="chart clarification resolved via LLM",
+                    )
+                    _understanding = frame_result_to_understanding(frame_result, raw_message, raw_message)
+                    override_db = resolve.get("override_target_db")
+                    if override_db:
+                        request_db = override_db
+                    return _finalize_decision(_understanding, session, request_db, raw_message)
 
                 # ── Other resolved types: reconstruct and re-route ────────────
                 # The pending clarification has been resolved. Update session state,
@@ -529,6 +586,65 @@ def decide(
                     session=session,
                 )
                 return _finalize_decision(_reclass, session, request_db, reconstructed)
+
+            else:
+                # Could not resolve the reply against the pending
+                # clarification. Previously this fell straight through to the
+                # "Normal Understanding + Routing Pipeline" below, silently
+                # re-interpreting the reply as a brand-new, unrelated message
+                # — which is how e.g. an unresolved chart-column answer ended
+                # up executing a plain SELECT instead of ever reaching the
+                # user again. Re-ask instead, and give up (clearing the
+                # pending state) only after repeated failures.
+                attempts = pending.get("attempts", 0) + 1
+                if attempts >= 3:
+                    _logger.info("Clarification abandoned after %d failed resolution attempts.", attempts)
+                    session["pending_clarification"] = None
+                    _understanding = UnderstandingResult(
+                        raw_input=raw_message,
+                        normalized_input=raw_message,
+                        intent="UNKNOWN",
+                        source="PENDING_ABANDONED",
+                        confidence=1.0,
+                        status="COMPLETED",
+                    )
+                    # Reuses the existing UNRECOGNIZED_QUERY early-return in
+                    # routers/chat.py (which returns without touching
+                    # session["pending_clarification"] at all) — every OTHER
+                    # route="CLARIFICATION" decision always re-persists some
+                    # pending_clarification dict there (with clarification_data
+                    # truthy or not), which would keep this "abandoned" state
+                    # alive indefinitely instead of actually clearing it.
+                    return GatewayDecision(
+                        understanding=_understanding,
+                        route="CLARIFICATION",
+                        needs_clarification=True,
+                        clarification_type="UNRECOGNIZED_QUERY",
+                        requires_db_connection=False,
+                        reason="Clarification abandoned after repeated failed resolution attempts.",
+                    )
+
+                pending["attempts"] = attempts
+                session["pending_clarification"] = pending
+                _understanding = UnderstandingResult(
+                    raw_input=raw_message,
+                    normalized_input=raw_message,
+                    intent="NEEDS_CLARIFICATION",
+                    source="PENDING_RETRY",
+                    confidence=1.0,
+                    status="COMPLETED",
+                )
+                return GatewayDecision(
+                    understanding=_understanding,
+                    route="CLARIFICATION",
+                    target_db=pending.get("target_db"),
+                    needs_clarification=True,
+                    clarification_type=pending.get("type"),
+                    clarification_message=pending.get("question") or "Sorry, I didn't catch that — could you rephrase?",
+                    clarification_data=pending,
+                    requires_db_connection=False,
+                    reason="Could not resolve reply against the pending clarification; re-asking.",
+                )
 
     # ── Normal Understanding + Routing Pipeline ────────────────────────────────
     understanding = process_universal_semantic_gateway(
