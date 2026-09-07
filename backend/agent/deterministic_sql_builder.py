@@ -12,6 +12,7 @@ Capability-Based Executability Policy:
   SQL generation or semantic dropping.
 """
 
+import re
 from typing import Optional, Tuple, Dict, Any, List
 import logging
 from models.schemas import QueryIntent, QueryFilter
@@ -32,10 +33,21 @@ def _serialize_sql_value(val: Any) -> str:
     return f"'{s_val}'"
 
 
-def is_deterministically_executable(query_intent: Optional[QueryIntent], target_table: Optional[str] = None) -> Tuple[bool, str]:
+def is_deterministically_executable(
+    query_intent: Optional[QueryIntent],
+    target_table: Optional[str] = None,
+    raw_message: Optional[str] = None,
+) -> Tuple[bool, str]:
     """
     Evaluates whether the given QueryIntent is 100% deterministically executable by the builder.
     Returns (True, reason) or (False, reason).
+
+    raw_message (optional): the original user message, used only for the
+    "unaccounted-for by X" safety check below (step 9). Passing it enables
+    a fail-safe fallback to the AI Planner for aggregation phrasings the
+    deterministic parser's regexes don't anticipate; omitting it (e.g. the
+    internal call from build_sql() below, which never sees the raw
+    message) simply skips that one extra check.
     """
     if not query_intent:
         return False, "QueryIntent is None"
@@ -102,6 +114,32 @@ def is_deterministically_executable(query_intent: Optional[QueryIntent], target_
             if not col:
                 return False, f"Aggregation missing column: {agg}"
 
+        # 6b. Filter-on-aggregated-column check — this builder always
+        # renders every filter as WHERE (applied to raw rows, BEFORE
+        # aggregation), never HAVING (applied to the aggregated result).
+        # When a filter's column is the SAME column an aggregation is
+        # computed over ("departments with average salary over 50000"),
+        # those two meanings genuinely diverge: WHERE-then-AVG silently
+        # computes each group's average from only the rows that already
+        # pass the filter, which is a DIFFERENT number from "this group's
+        # real average, only keep groups where that average clears the
+        # bar" (HAVING) — and both are plausible readings of the same
+        # sentence. Building either one with silent confidence risks
+        # presenting a wrong number as a real answer, so this refuses
+        # deterministic execution and defers to the AI Planner instead,
+        # which can weigh the full sentence (e.g. an explicit "having").
+        agg_columns = {
+            str(getattr(agg, "column", None) or (agg.get("column") if isinstance(agg, dict) else "")).lower()
+            for agg in query_intent.aggregations
+        }
+        for f in (query_intent.constraints.filters if query_intent.constraints else None) or []:
+            f_col = str(getattr(f, "column", None) or (f.get("column") if isinstance(f, dict) else "")).lower()
+            if f_col and f_col in agg_columns:
+                return False, (
+                    f"Filter on '{f_col}' matches an aggregated column — WHERE vs HAVING is "
+                    f"ambiguous here, deferring to AI Planner rather than risk a silently wrong result"
+                )
+
     # 7. Grouping check
     if query_intent.grouping:
         for g in query_intent.grouping:
@@ -111,6 +149,35 @@ def is_deterministically_executable(query_intent: Optional[QueryIntent], target_
     # 8. Comparisons check (must be empty)
     if query_intent.comparisons:
         return False, "Complex comparisons require LocalPlanner SQL reasoning"
+
+    # 9. Safety net: an aggregation together with a trailing "by <word>" in
+    #    the raw message that resolves to a real, plausible column name but
+    #    isn't reflected in grouping, ordering, or a filter suggests the
+    #    deterministic parser's regexes probably missed something (the
+    #    "average salary by department" class of bug) — refuse
+    #    deterministic execution rather than silently drop it, and let the
+    #    caller fall through to the AI Planner instead, which reads the
+    #    full sentence and is far more likely to catch it. This is a
+    #    fail-safe for phrasings the grouping-detection widening in
+    #    semantic_frame.py doesn't anticipate, not a replacement for it.
+    if raw_message and query_intent.aggregations:
+        m = re.search(r"(?<!order )(?<!sorted )(?<!sort on )\bby\s+([a-z_]+)\b", raw_message.lower())
+        if m:
+            candidate_col = m.group(1)
+            grouped = {str(g).lower() for g in (query_intent.grouping or [])}
+            ordered = {
+                str(getattr(o, "column", None) or (o.get("column") if isinstance(o, dict) else "") or "").lower()
+                for o in (query_intent.ordering or [])
+            }
+            filtered = {
+                str(getattr(f, "column", None) or (f.get("column") if isinstance(f, dict) else "") or "").lower()
+                for f in ((query_intent.constraints.filters if query_intent.constraints else None) or [])
+            }
+            if candidate_col not in grouped and candidate_col not in ordered and candidate_col not in filtered:
+                return False, (
+                    f"Message contains 'by {candidate_col}' not reflected in grouping/ordering/"
+                    f"filters — deferring to AI Planner rather than risk silently dropping it"
+                )
 
     return True, "QueryIntent is fully supported for deterministic SQL construction"
 

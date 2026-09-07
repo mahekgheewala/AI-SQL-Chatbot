@@ -91,32 +91,21 @@ def _clear_viz_cache_for_session(session_id: str) -> None:
 # ─── Semantic Axis Translation Helpers ────────────────────────────────────────
 
 def _get_semantic_name(col: str) -> str:
+    """Human-readable form of a column name for chart summary sentences.
+
+    Deliberately just cleans up the real column name (lowercase,
+    underscores to spaces) rather than guessing a "nicer" category word —
+    this function used to keyword-match toward a fixed set of categories
+    written for one specific HR demo schema (e.g. any column containing
+    "name" was mapped to the literal word "employees," regardless of the
+    actual table), which produced confidently wrong summary sentences on
+    any other dataset. The real column name, cleaned up, is always
+    correct for every table; a guessed category only happened to be right
+    for the one dataset it was written against.
+    """
     if not col:
         return ""
-    col_lower = col.lower()
-    if "salary" in col_lower or "wage" in col_lower or "earnings" in col_lower:
-        return "employee salaries"
-    if "revenue" in col_lower:
-        return "revenue"
-    if "sale" in col_lower:
-        return "sales"
-    if "price" in col_lower or "cost" in col_lower:
-        return "prices"
-    if "amount" in col_lower:
-        return "amounts"
-    if "score" in col_lower:
-        return "scores"
-    if "department" in col_lower:
-        return "departments"
-    if "name" in col_lower:
-        return "employees"
-    if "product" in col_lower:
-        return "products"
-    if "category" in col_lower:
-        return "categories"
-    if "date" in col_lower or "time" in col_lower or "year" in col_lower:
-        return "time"
-    return col_lower.replace("_", " ")
+    return col.lower().replace("_", " ")
 
 
 # ─── Engine ──────────────────────────────────────────────────────────────────
@@ -147,7 +136,21 @@ class VisualizationEngine:
         all_cols      = processed_result.dataset.columns
         dataset_fp    = processed_result.execution.sql or ""
         dataset_fp    = hashlib.sha256(dataset_fp.encode()).hexdigest()[:24] if dataset_fp else "unknown"
-        source_table  = (processed_result.execution.sql or "").split("FROM")[-1].strip().rstrip(";").split()[0] if processed_result.execution.sql else ""
+        # Best-effort guess at the source table name for the chart title —
+        # cosmetic only. Must never be able to take down chart generation
+        # entirely over a shape it doesn't expect (e.g. the SQL ending
+        # right at "FROM" with nothing after it, which previously threw an
+        # unguarded IndexError on the trailing .split()[0] and discarded
+        # an otherwise perfectly good chart).
+        source_table = ""
+        try:
+            _sql_text = processed_result.execution.sql or ""
+            if _sql_text:
+                _after_from = _sql_text.split("FROM")[-1].strip().rstrip(";").split()
+                if _after_from:
+                    source_table = _after_from[0]
+        except Exception:
+            source_table = ""
         source_db     = processed_result.execution.database_name or ""
 
         # ── 0. Handle Visualization Overrides ─────────────────────────────────

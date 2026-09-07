@@ -149,14 +149,25 @@ def _resolve_route(
         resolve_reason = "GLOBAL_SELECTED_DB"
 
     # ── Terminal Failure Check ────────────────────────────────────────────────
+    # Deterministic understanding could not structure this message — rather
+    # than dead-ending straight to a clarification question (which the user
+    # could not act on, since we can't even say *what* was ambiguous), hand
+    # it to the AI reasoning path instead. "Totally unparseable by the
+    # rules" is just an extreme case of "complex"; the same route already
+    # used for other hard requests applies here too. intent="UNKNOWN" makes
+    # get_handler() resolve to UnknownHandler, which calls coordinator_run()
+    # (Local Planner -> Gemini Executor) — see agent/handlers.py. Every
+    # AI-produced SQL statement still passes all 3 validation gates
+    # afterward, so this never weakens the "never invent a table/column"
+    # guarantee; if the AI is also unsure, it can still ask for clarification
+    # itself via its own clarification_required path.
     if understanding.status == "UNDERSTANDING_FAILED":
         return RoutingDecision(
-            route="CLARIFICATION",
+            route="AI_PLANNER",
             intent="UNKNOWN",
             target_db=resolved_db,
-            needs_clarification=True,
-            clarification_type="UNRECOGNIZED_QUERY",
-            reason="Phase 1 semantic role parser could not safely structure query."
+            needs_clarification=False,
+            reason="Phase 1 semantic role parser could not safely structure query — handing off to AI Planner instead of dead-ending."
         )
 
     # Multi-database table ambiguity check
@@ -275,7 +286,8 @@ def _resolve_route(
         from agent.deterministic_sql_builder import is_deterministically_executable
         executable, exec_reason = is_deterministically_executable(
             query_intent=understanding.query_intent,
-            target_table=target_table
+            target_table=target_table,
+            raw_message=msg_normalized,
         )
         if executable:
             return RoutingDecision(
@@ -484,7 +496,7 @@ def decide(
                         target_db=resolve.get("override_target_db"),
                         needs_clarification=True,
                         clarification_type="CREATE_TABLE_COLUMNS",
-                        clarification_message=f"Table name set to **{resolve['metadata'].get('table_name')}**. Please provide the list of columns with their data types (e.g., id int, name text).",
+                        clarification_message=f"Table name set to **{resolve['metadata'].get('table_name')}**. What columns should this table have? You can give exact types (e.g. `id int, name text`) — or just the names, and I'll pick sensible types for anything you leave out.",
                         clarification_data=resolve,
                         requires_db_connection=False,
                         reason="Pending CREATE_TABLE_NAME_SET resolved — waiting for column definitions.",
@@ -518,6 +530,13 @@ def decide(
                             "sql": _sql,
                             "target_db": _db,
                             "intent": "CREATE_TABLE",
+                            # Carried through from resolve_pending_clarification()
+                            # so routers/chat.py's CONFIRMATION handler can build
+                            # an honest success message — see
+                            # _resolve_create_table_columns_via_llm() in
+                            # agent/pending_resolution.py.
+                            "columns": (resolve.get("metadata") or {}).get("columns"),
+                            "defaulted_columns": (resolve.get("metadata") or {}).get("defaulted_columns"),
                         },
                         requires_db_connection=True,
                         reason="Pending CREATE_TABLE_COLUMNS resolved — SQL ready to execute.",

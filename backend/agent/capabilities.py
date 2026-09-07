@@ -83,7 +83,13 @@ CAPABILITIES: Tuple[Capability, ...] = (
         action="alter",
         object_type="COLUMN",
         route="SQL_BUILDER",
-        legacy_intent="ADD_COLUMN",
+        # Was "ADD_COLUMN" (copy-pasted from the capability above) — the
+        # actual SQL-text-based risk classification in execute_sql()
+        # re-derives the real operation from the generated SQL and isn't
+        # affected by this, but the label itself is still wrong wherever
+        # it's surfaced on its own (e.g. the response payload's `intent`
+        # field showing "ADD_COLUMN" for a drop request).
+        legacy_intent="DROP_COLUMN",
         required_roles=("table", "column"),
         optional_roles=("database",),
     ),
@@ -92,7 +98,12 @@ CAPABILITIES: Tuple[Capability, ...] = (
         action="alter",
         object_type="COLUMN",
         route="SQL_BUILDER",
-        legacy_intent="ADD_COLUMN",
+        # Was "ADD_COLUMN" — same copy-paste as drop_column above.
+        # "MODIFY_COLUMN" matches the label validation/safety_checker.py
+        # and validation/schema_creator_validator.py already use for a
+        # column TYPE change, so this now agrees with the rest of the app
+        # instead of introducing a fourth spelling for the same concept.
+        legacy_intent="MODIFY_COLUMN",
         required_roles=("table", "column"),
         optional_roles=("database", "column_type"),
     ),

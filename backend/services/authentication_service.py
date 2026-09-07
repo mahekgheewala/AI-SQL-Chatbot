@@ -51,6 +51,17 @@ class AuthenticationService:
         if user.verification_expires_at is None or user.verification_expires_at < datetime.utcnow():
             raise ValueError("Verification token expired")
 
+        # Reuses this same token pair for an email-CHANGE confirmation, not
+        # just initial signup verification — change_email() below sets
+        # pending_email and issues a token exactly the same way register()
+        # does. If a pending_email is waiting, this redemption swaps it in;
+        # otherwise it's a normal signup verification.
+        if user.pending_email:
+            if self.user_repo.get_user_by_email(user.pending_email):
+                raise ValueError("That email is no longer available")
+            user.email = user.pending_email
+            user.pending_email = None
+
         # Mark verified and consume the token (prevents reuse).
         user.is_verified = True
         user.verification_token_hash = None
@@ -131,9 +142,28 @@ class AuthenticationService:
         return user, access_token, new_refresh_token
 
     # ── Logout ────────────────────────────────────────────────────────────────
-    def logout(self, user_id: int):
-        # Revoke the refresh token session and all server-controlled chat sessions.
-        self.session_repo.delete_user_session(user_id)
+    def logout(self, user_id: int, refresh_token: str = None):
+        # With multi-device sessions, a logout should end only the calling
+        # device by default — ending every device's session just because
+        # one of them logged out would defeat the point of allowing
+        # multiple concurrent sessions at all. Falls back to ending every
+        # session (the old behavior) only when no refresh token is given,
+        # so an older client that doesn't send one still gets a full
+        # logout instead of silently doing nothing.
+        if refresh_token:
+            token_hash = hash_token(refresh_token)
+            deleted = self.session_repo.delete_session_by_token_hash(user_id, token_hash)
+            if deleted:
+                # Targeted, single-device logout — there's no reliable way
+                # to know which chat/conversation sessions belong to just
+                # THIS device (a device can have several open chat tabs,
+                # each its own session_id, with no link back to the login
+                # session), so leave chat state alone here rather than
+                # wiping the other devices' active conversations too.
+                return
+            self.session_repo.delete_user_session(user_id)
+        else:
+            self.session_repo.delete_user_session(user_id)
         self._revoke_chat_sessions(user_id)
 
     # ── Forgot password ───────────────────────────────────────────────────────
@@ -196,6 +226,41 @@ class AuthenticationService:
         self._revoke_chat_sessions(user.id)
         return user
 
+    # ── Change email ──────────────────────────────────────────────────────────
+    def change_email(self, user: User, new_email: str, current_password: str) -> None:
+        if not verify_password(current_password, user.password_hash):
+            raise ValueError("Current password is incorrect")
+        if new_email.lower() == user.email.lower():
+            raise ValueError("That is already your current email")
+        if self.user_repo.get_user_by_email(new_email):
+            raise ValueError("Email already registered")
+
+        # The address in `email` does NOT change until the new one is
+        # confirmed — otherwise a stolen password alone would let an
+        # attacker immediately take over the account under an email only
+        # they control, before the real owner could ever notice.
+        user.pending_email = new_email
+        verification_token = secrets.token_urlsafe(32)
+        user.verification_token_hash = hash_token(verification_token)
+        user.verification_expires_at = datetime.utcnow() + timedelta(hours=VERIFICATION_TOKEN_EXPIRE_HOURS)
+        self.user_repo.update_user(user)
+
+        self.email_service.send_verification_email(new_email, verification_token)
+
+    # ── Delete account ────────────────────────────────────────────────────────
+    def delete_account(self, user: User, current_password: str) -> None:
+        if not verify_password(current_password, user.password_hash):
+            raise ValueError("Current password is incorrect")
+
+        user_id = user.id
+        self._revoke_chat_sessions(user_id)
+        # Sessions, connections, preferences, login history, and chat
+        # sessions are all declared cascade="all, delete-orphan" on User's
+        # relationships (models/domain.py), so deleting the user row alone
+        # is sufficient — no separate cleanup calls needed per table.
+        self.db.delete(user)
+        self.db.commit()
+
     # ── Internals ─────────────────────────────────────────────────────────────
     def _issue_tokens(self, user: User) -> tuple[str, str]:
         access_token = create_access_token(data={"sub": str(user.id)})
@@ -203,8 +268,9 @@ class AuthenticationService:
         return access_token, refresh_token
 
     def _store_refresh_token(self, user_id: int, refresh_token: str) -> None:
-        """Store the hashed refresh token for the user (single session per user)."""
-        self.session_repo.delete_user_session(user_id)
+        """Store the hashed refresh token as a NEW session for the user —
+        multiple concurrent sessions are allowed, so logging in on a second
+        device must not delete the first device's still-valid session."""
         session = UserSession(
             user_id=user_id,
             hashed_refresh_token=hash_token(refresh_token),

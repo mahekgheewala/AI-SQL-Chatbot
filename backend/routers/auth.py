@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
@@ -32,6 +34,19 @@ class ResetPasswordRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
+
+class LogoutRequest(BaseModel):
+    # Optional: names which device's session to end. Omitting it (or an
+    # older client that doesn't send one) falls back to ending every
+    # session for the user, same as before multi-device support existed.
+    refresh_token: Optional[str] = None
+
+class ChangeEmailRequest(BaseModel):
+    new_email: EmailStr
+    current_password: str
+
+class DeleteAccountRequest(BaseModel):
+    current_password: str
 
 class UserResponse(BaseModel):
     id: int
@@ -125,10 +140,41 @@ def change_password(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@router.post("/logout")
-def logout(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+@router.post("/change-email")
+def change_email(
+    request: ChangeEmailRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     auth_service = AuthenticationService(db)
-    auth_service.logout(current_user.id)
+    try:
+        auth_service.change_email(current_user, str(request.new_email), request.current_password)
+        return {"message": "Confirmation email sent to the new address. Your email won't change until you confirm it."}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/delete-account")
+def delete_account(
+    request: DeleteAccountRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    auth_service = AuthenticationService(db)
+    try:
+        auth_service.delete_account(current_user, request.current_password)
+        return {"message": "Account deleted"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/logout")
+def logout(
+    request: Optional[LogoutRequest] = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    auth_service = AuthenticationService(db)
+    refresh_token = request.refresh_token if request else None
+    auth_service.logout(current_user.id, refresh_token=refresh_token)
     return {"message": "Logged out successfully"}
 
 @router.get("/me", response_model=dict)

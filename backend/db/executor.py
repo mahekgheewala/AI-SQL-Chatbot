@@ -4,7 +4,7 @@ import time
 from typing import Optional
 from connections.connection_manager import ConnectionManager
 from db.app_database import SessionLocal
-from utils.config_loader import get_superdb_name
+from utils.config_loader import get_superdb_name, get_max_result_rows
 from utils.logging_config import database_name_var, logger_query, user_id_var
 
 _NON_TRANSACTIONAL_PATTERN = re.compile(
@@ -22,6 +22,23 @@ _SUPERDB_COMMAND_PATTERN = re.compile(
     r'^\s*(?:CREATE|DROP)\s+DATABASE\b',
     re.IGNORECASE | re.DOTALL
 )
+
+_STRING_LITERAL_FOR_LOGGING_RE = re.compile(r"'(?:[^']|'')*'")
+
+
+def _redact_sql_for_logging(sql: str) -> str:
+    """Replace the CONTENTS of quoted string literals with a fixed
+    placeholder before this SQL is written to any log — a literal value
+    (an SSN, an email, a name) embedded in generated SQL should not land in
+    plaintext logs / log aggregation / backups. Every keyword, table name,
+    column name, and the query's overall shape (which columns, which
+    clauses, how many literals) stays fully intact, preserving debugging/
+    audit value. This never touches the SQL that actually executes against
+    the database — only the copy written to logs."""
+    if not sql:
+        return sql
+    return _STRING_LITERAL_FOR_LOGGING_RE.sub("'***'", sql)
+
 
 def _is_select(sql: str) -> bool:
     return sql.strip().upper().startswith("SELECT")
@@ -110,8 +127,19 @@ def execute_sql(sql: str, dbname: str, intent: Optional[str] = None) -> dict:
     start_time = time.perf_counter()
 
     try:
+        # Database-enforced backstop (Issue 1): any statement that is
+        # textually a SELECT gets a connection PostgreSQL itself has been
+        # told is read-only (see ConnectionManager.get_connection's
+        # read_only param) — independent of whatever the application's own
+        # safety_checker decided upstream. If a write ever reaches here
+        # disguised as/smuggled inside something is_select() calls a
+        # SELECT (a stacking bypass, a "SELECT ... INTO" that actually
+        # creates a table, a future regex gap), PostgreSQL rejects the
+        # write outright instead of the app's own classification being the
+        # only thing standing between the request and it actually running.
         conn = ConnectionManager.get_connection(
-            user_id, db_session, target_database=dbname, is_autocommit=is_non_transactional
+            user_id, db_session, target_database=dbname, is_autocommit=is_non_transactional,
+            read_only=is_select,
         )
         if is_non_transactional and not conn.autocommit:
             conn.autocommit = True
@@ -120,20 +148,41 @@ def execute_sql(sql: str, dbname: str, intent: Optional[str] = None) -> dict:
         cursor.execute(sql)
 
         if is_select:
-            rows = cursor.fetchall()
+            # Bounded fetch, not fetchall() — a query with no LIMIT (e.g.
+            # "show me all orders") could otherwise pull millions of rows
+            # into Python process memory and the HTTP response body. The
+            # query itself still runs to completion server-side and
+            # PostgreSQL still computes the real aggregate/grouped result
+            # over the full table either way — this only caps how many
+            # rows get pulled to the client, so COUNT/SUM/GROUP BY results
+            # (already at most one row per group, essentially never near
+            # this cap) are completely unaffected. Fetches one extra row
+            # purely to detect truncation, then discards it — never
+            # returned or counted.
+            max_rows = get_max_result_rows()
+            fetched = cursor.fetchmany(max_rows + 1)
+            truncated = len(fetched) > max_rows
+            rows = fetched[:max_rows]
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            
+
             column_types = {}
             if cursor.description:
                 for desc in cursor.description:
                     column_types[desc[0]] = desc[1]
-            
+
             result["success"] = True
             result["columns"] = columns
             result["rows"] = [list(row) for row in rows]
             result["row_count"] = len(rows)
             result["column_types"] = column_types
-            result["message"] = "Query executed successfully."
+            result["truncated"] = truncated
+            if truncated:
+                result["message"] = (
+                    f"Query executed successfully. Showing the first {max_rows} rows "
+                    f"— more rows were available but not returned."
+                )
+            else:
+                result["message"] = "Query executed successfully."
             
         else:
             row_count = cursor.rowcount
@@ -167,7 +216,7 @@ def execute_sql(sql: str, dbname: str, intent: Optional[str] = None) -> dict:
                     "category": "query",
                     "operation_type": operation,
                     "intent": intent,
-                    "sql": sql,
+                    "sql": _redact_sql_for_logging(sql),
                     "database_name": dbname,
                     "execution_time_ms": duration_ms,
                     "row_count": result["row_count"],
@@ -181,7 +230,32 @@ def execute_sql(sql: str, dbname: str, intent: Optional[str] = None) -> dict:
         error_msg = str(e).strip()
         result["success"] = False
         result["error"] = error_msg
-        
+
+        # Issue 9: the app's cached schema (state/metadata_store.py) is
+        # only refreshed when this app's own DDL runs, or when switching
+        # to a database it hasn't cached before — staying on one database
+        # means the schema is fetched once and trusted indefinitely. If a
+        # table/column changed through any other means (a DBA, another
+        # tool, another session), the cache doesn't know, and the AI keeps
+        # generating SQL against the stale picture. PostgreSQL's own
+        # undefined_column (42703) / undefined_table (42P01) SQLSTATEs are
+        # an unambiguous, cheap signal that the cache disagrees with
+        # reality — not e.g. a plain typo, which fails with the same kind
+        # of error but refreshing wouldn't fix anyway — so the refresh is
+        # scoped to only these two codes rather than every failure.
+        if getattr(e, "pgcode", None) in ("42703", "42P01") and dbname:
+            try:
+                from state.metadata_store import set_cached_schema_db, sync_database_context
+                set_cached_schema_db(None)
+                sync_database_context(dbname)
+                logger_query.info(
+                    f"Schema cache invalidated for '{dbname}' after {e.pgcode} "
+                    f"(undefined column/table) — likely stale metadata.",
+                    extra={"category": "query", "database_name": dbname, "pgcode": e.pgcode},
+                )
+            except Exception:
+                pass
+
         duration_ms = (time.perf_counter() - start_time) * 1000
         try:
             logger_query.error(
@@ -190,7 +264,7 @@ def execute_sql(sql: str, dbname: str, intent: Optional[str] = None) -> dict:
                     "category": "query",
                     "operation_type": operation,
                     "intent": intent,
-                    "sql": sql,
+                    "sql": _redact_sql_for_logging(sql),
                     "database_name": dbname,
                     "execution_time_ms": duration_ms,
                     "success": False,
@@ -219,7 +293,7 @@ def execute_sql(sql: str, dbname: str, intent: Optional[str] = None) -> dict:
                     "category": "query",
                     "operation_type": operation,
                     "intent": intent,
-                    "sql": sql,
+                    "sql": _redact_sql_for_logging(sql),
                     "database_name": dbname,
                     "execution_time_ms": duration_ms,
                     "success": False,
@@ -228,7 +302,22 @@ def execute_sql(sql: str, dbname: str, intent: Optional[str] = None) -> dict:
             )
         except Exception:
             pass
-        
+
+        # Same cleanup the psycopg2.Error branch above already does. A
+        # non-driver exception (e.g. a bug in the result-row processing
+        # code, after cursor.execute() already succeeded) previously left
+        # this branch with no rollback at all — the connection could be
+        # returned to the cache mid-transaction, relying entirely on a
+        # LATER caller's own defensive idle-check (in
+        # ConnectionManager.get_connection()) to eventually clean it up.
+        # Every failure path now leaves the connection in a known-clean
+        # state before it's ever reused.
+        if conn and not is_non_transactional:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
     finally:
         if cursor:
             cursor.close()

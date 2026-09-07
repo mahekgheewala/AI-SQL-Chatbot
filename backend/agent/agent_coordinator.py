@@ -57,7 +57,11 @@ from state.metadata_store import get_metadata
 
 # Import centralized model manager
 from ai import model_manager
-from agent.local_planner import plan as local_plan
+from agent.local_planner import plan as local_plan, extract_json_object
+from agent.semantic_frame import (
+    _tokens as _sf_tokens,
+    _has_grounded_table_or_column,
+)
 
 UTILITY_TOOL_INTENTS = {
     "switch_database": "SWITCH_DATABASE",
@@ -86,6 +90,19 @@ _VISUALIZATION_KEYWORDS = re.compile(
     r"\b(plot|chart|graph|visualize|visualization|histogram|scatter|pie|box|distribution)\b",
     re.IGNORECASE,
 )
+
+# ─── Report requirements-gathering ───────────────────────────────────────────
+# A "report" request (unlike execute_sql/summarize) has no capability entry
+# in agent/capabilities.py — it's entirely AI-planner-driven, and
+# generate_report() itself is a pure formatter that narrates whatever rows
+# it's handed with no completeness checking of its own (see audit finding).
+# Left alone, "give me a report" with no named table forces the Local
+# Planner to silently guess a table/query on its own, and generate_report()
+# then confidently narrates the guess with nothing telling the user a guess
+# was made. _REPORT_REQUEST_PATTERN below is used only to decide whether to
+# ask what the report should cover BEFORE any AI call — see the check near
+# the top of run().
+_REPORT_REQUEST_PATTERN = re.compile(r"\breports?\b", re.IGNORECASE)
 
 # ─── Phase 8.10: Deterministic dispatch rules ────────────────────────────────
 # Phase 4.5 Finding 2: Generalised switch-DB rule.
@@ -134,6 +151,28 @@ def _find_table_location_tool(message: str) -> Optional[str]:
     return None
 
 
+def _estimate_requested_step_count(message: str) -> int:
+    """Cheap signal for whether a message asked for more than one distinct
+    operation ("create a table X and add 10 sample rows" vs "create a
+    table X") — counts recognized action words in the raw message, reusing
+    the same ACTION_WORDS vocabulary semantic_frame.py already uses to
+    detect actions, rather than a second word list.
+
+    This is deliberately not a real plan — it's a lower bound used only to
+    decide whether the orchestration loop below should keep going after a
+    successful step instead of stopping unconditionally. A single-action
+    message ("create a table employees") returns 1, so nothing changes for
+    the common case; a message naming multiple actions returns >1, giving
+    the loop's existing per-step Executor call (which already runs on
+    every iteration after step 0, already sees the full user_message and
+    what's already been done via its execution trace) a chance to actually
+    run rather than being cut off after the first success.
+    """
+    from agent.semantic_frame import ACTION_WORDS
+    tokens = re.findall(r"[a-zA-Z']+", message.lower())
+    return max(1, sum(1 for t in tokens if t in ACTION_WORDS))
+
+
 # ─── Tool selection from the gateway's already-grounded SemanticFrame ───────
 # agent.universal_gateway.decide() has already run interpret_message() exactly
 # once (before this coordinator was ever invoked) and produced a fully-grounded
@@ -155,9 +194,13 @@ _SEMANTIC_TOOL_MAP: dict = {
     "retrieve": "execute_sql",
     "raw_sql": "execute_sql",
     "visualize": "execute_sql",
+    # add_sample_data resolves to a generated INSERT via the same safe
+    # resolve_sample_data_request() path clarification-resolved requests
+    # already use (see the cap_id == "add_sample_data" block below) —
+    # ends up dispatched as "execute_sql" like retrieve/visualize above.
+    "add_sample_data": "execute_sql",
     # Capabilities below intentionally have NO tool mapping — they fall through
-    # to the planner / visualization pipeline (charts, sample data, chat).
-    "add_sample_data": None,
+    # to the planner / visualization pipeline (charts, chat).
     "general_conversation": None,
     "understanding_failed": None,
 }
@@ -206,7 +249,7 @@ def _tool_from_frame(frame, pipeline_hint: Optional[str], user_message: str) -> 
         query_intent = frame_to_query_intent(frame)
         if query_intent is None:
             return result
-        executable, _reason = is_deterministically_executable(query_intent, target_table=frame.table)
+        executable, _reason = is_deterministically_executable(query_intent, target_table=frame.table, raw_message=user_message)
         if not executable:
             return result  # needs LocalPlanner SQL reasoning
         try:
@@ -227,7 +270,7 @@ def _tool_from_frame(frame, pipeline_hint: Optional[str], user_message: str) -> 
         query_intent = frame_to_chart_query_intent(frame)
         if query_intent is None:
             return result
-        executable, _reason = is_deterministically_executable(query_intent, target_table=frame.table)
+        executable, _reason = is_deterministically_executable(query_intent, target_table=frame.table, raw_message=user_message)
         if not executable:
             return result
         try:
@@ -249,6 +292,36 @@ def _tool_from_frame(frame, pipeline_hint: Optional[str], user_message: str) -> 
             result["tool"] = tool_name
             result["tool_input"] = sql
         except Exception:
+            result["tool"] = None
+        return result
+
+    if cap_id == "add_sample_data":
+        # Route a fully-specified request (table named upfront — the
+        # common case) through the SAME safe generator used when the
+        # table was missing and had to be resolved via a follow-up
+        # question (agent/clarification_resolver.py's
+        # resolve_sample_data_request(), which deterministically enforces
+        # id-like-column uniqueness against the real live table).
+        # Previously this capability had no entry in _SEMANTIC_TOOL_MAP at
+        # all, so a fully-specified request fell straight through to the
+        # general AI Planner path with no uniqueness guarantee whatsoever
+        # — the safety net only ever protected the less common,
+        # clarification-resolved entry path.
+        from agent.clarification_resolver import resolve_sample_data_request
+        from state.metadata_store import get_metadata
+        from agent.semantic_frame import build_grounding_metadata
+        grounding_meta = build_grounding_metadata(get_metadata(), frame.database)
+        sample_result = resolve_sample_data_request(
+            original_request=user_message,
+            user_reply=user_message,
+            metadata=grounding_meta,
+            table_hint=frame.table,
+            row_count_hint=frame.sample_data.count if frame.sample_data else None,
+        )
+        if sample_result.ok and sample_result.insert_sql:
+            result["tool"] = tool_name
+            result["tool_input"] = sample_result.insert_sql
+        else:
             result["tool"] = None
         return result
 
@@ -519,6 +592,45 @@ def run(
         gemini_metrics.record_bypass("planner")
         print(f"[Coordinator] Planner bypass recorded — request routed directly to '{first_tool_override}'.")
 
+    # ── Report requirements-gathering ────────────────────────────────────────
+    # Deterministic gate, run before any AI call (same defensive posture as
+    # capability_check.py's role checks) — a report request that names no
+    # table and no groundable column anywhere in the message gives the Local
+    # Planner nothing real to build a query from, so it would otherwise
+    # silently pick something and generate_report() would confidently
+    # narrate that guess. Ask what the report should cover instead of
+    # guessing. Uses clarification_type "MISSING_ROLE", which already has a
+    # generic "append the reply to the original request and re-understand
+    # the combined message" resolver (agent/pending_resolution.py) — reused
+    # here rather than building a second resolution mechanism.
+    from state.metadata_store import get_metadata as _current_metadata_for_report_check
+    if (
+        not first_tool_override
+        and not frame.table
+        and _REPORT_REQUEST_PATTERN.search(user_message)
+        and not _has_grounded_table_or_column(
+            _sf_tokens(user_message), _current_metadata_for_report_check()
+        )
+    ):
+        clarification_question = (
+            "What would you like this report to cover? Please name the table "
+            "(and any specific columns, filters, or time range) you'd like included."
+        )
+        response_payload["intent"] = "NEEDS_CLARIFICATION"
+        response_payload["reply"] = clarification_question
+        response_payload["question"] = clarification_question
+        response_payload["valid"] = True
+        response_payload["risk_level"] = None
+        response_payload["clarification_data"] = {
+            "type": "MISSING_ROLE",
+            "capability_id": "generate_report",
+            "original_request": user_message,
+            "options": [],
+            "target_db": target_db,
+            "question": clarification_question,
+        }
+        return response_payload
+
     # ── Phase 2: Local Planner (Qwen 3) ──────────────────────────────────────
     planning_doc = None
     if not first_tool_override:
@@ -569,7 +681,47 @@ def run(
                     "target_db": target_db,
                     "question": clarification_question,
                 }
+
+            # clarification_data_for_frame() defaults to "MISSING_ROLE"
+            # whenever the frame it's classifying from doesn't cleanly map
+            # to a more specific bucket — which is exactly what happens
+            # when the *deterministic* parser failed to structure the
+            # message at all (frame.capability_id == "understanding_failed")
+            # and it was the AI Planner, not the frame, that figured out
+            # what's actually missing. Nothing downstream knows how to
+            # resolve a bare MISSING_ROLE reply outside the chart
+            # (visualize) case — see agent/pending_resolution.py's
+            # resolve_pending_clarification(), section 4.6 — so this
+            # previously became a dead end no answer could ever satisfy,
+            # even though the Planner's own Planning Document had already
+            # identified the table name (that's the "'marks'" in its
+            # question text). When the Planner flagged this as a DDL
+            # request and already named a table, relabel it as
+            # CREATE_TABLE_COLUMNS and carry the table name forward — reuses
+            # the same, already-working column-resolution path a normal
+            # one-shot "create table X" clarification already uses, instead
+            # of building a second one.
+            clar_data = response_payload.get("clarification_data") or {}
+            if clar_data.get("type") == "MISSING_ROLE" and clar_data.get("capability_id") != "visualize":
+                db_ctx = plan_inner.get("database_context") or {}
+                candidate_tables = db_ctx.get("required_schema_objects") or []
+                if plan_inner.get("user_intent") == "DDL Operation" and candidate_tables:
+                    clar_data["type"] = "CREATE_TABLE_COLUMNS"
+                    clar_data["table_name"] = candidate_tables[0]
+                    clar_data["capability_id"] = "create_table"
+
             return response_payload
+
+    # Root cause of the "create a table and add sample data" class of
+    # request never completing past step 1: both loop-termination points
+    # below used to break unconditionally after any single successful
+    # operation, regardless of _MAX_TOOL_CALLS allowing more iterations
+    # and regardless of whether the message asked for more than one thing.
+    # estimated_steps is a lower-bound signal (see
+    # _estimate_requested_step_count's docstring) the two break points now
+    # consult before stopping — for the common single-action message this
+    # is 1, so nothing about today's behavior changes.
+    estimated_steps = _estimate_requested_step_count(user_message)
 
     for step in range(_MAX_TOOL_CALLS):
 
@@ -611,7 +763,9 @@ def run(
                 f"2. FOREIGN-KEY JOIN GROUNDING: You may ONLY generate JOIN clauses between tables if an explicit Foreign Key relationship is listed under ACTIVE DATABASE FOREIGN KEYS in CONTEXT. NEVER join tables on non-key columns (e.g. NEVER join ON e.salary = s.salary or ON e.name = s.name).\n"
                 f"3. UNCONNECTED TABLES & LIMITATION EXPLANATION: If the user request requires columns from multiple tables (e.g. employee names and department) but NO Foreign Key relationship exists between those tables, query the primary table containing the filter criteria (e.g. SELECT department, salary, hire_date FROM salaries WHERE department = 'Engineering') and include a clear note that individual employee names cannot be linked to departments in this schema.\n"
                 f"4. DIRECT FILTERING: Filter directly on table columns (e.g. WHERE department = 'Engineering') without attempting invalid or fabricated joins.\n"
-                f"5. FOLLOW-UP CONTEXT PRESERVATION: When the user message is a follow-up query (e.g. 'Now just the ones hired after 2022.'), you MUST preserve and combine active filter conditions from previous turns in CONVERSATION HISTORY (e.g. department = 'Engineering') with the new filter conditions (e.g. hire_date > '2022-12-31') in your WHERE clause.\n\n"
+                f"5. FOLLOW-UP CONTEXT PRESERVATION: When the user message is a follow-up query (e.g. 'Now just the ones hired after 2022.'), you MUST preserve and combine active filter conditions from previous turns in CONVERSATION HISTORY (e.g. department = 'Engineering') with the new filter conditions (e.g. hire_date > '2022-12-31') in your WHERE clause.\n"
+                f"6. STATE MINOR ASSUMPTIONS: If the Planning Document did not flag the request as needing clarification, but you still had to pick between multiple reasonable ways to answer it (which measure column to use, which time range 'recent' means, etc.), pick the most defensible one AND say so in your final reply (e.g. 'Assuming \"top\" means by total revenue — let me know if you meant something else'). Never present a picked interpretation as if it were the only possible one.\n"
+                f"7. DO NOT REPEAT A COMPLETED STEP: Check EXECUTION TRACE below before deciding what to do. If it shows an operation already succeeded (e.g. a table was already created), do NOT include that operation again in your next tool_input — write ONLY the next remaining operation as its own single statement (e.g. a plain INSERT into the table that was just created, never 'CREATE TABLE ...; INSERT ...;' combined). Combining an already-done step with a new one produces a multi-statement SQL string, which the safety gate will always reject — writing the single next statement alone is both correct and the only way it will actually execute.\n\n"
                 f"PLANNING DOCUMENT:\n"
                 f"{json.dumps(planning_doc, indent=2) if planning_doc else 'None'}\n\n"
                 f"CONTEXT:\n"
@@ -719,7 +873,13 @@ def run(
                     )
                     cost = gemini_metrics.estimate_cost(prompt_tokens, completion_tokens)
 
-                plan = json.loads(raw_response.text)
+                # Same tolerant extraction the Local Planner's own response
+                # already uses (strips stray commentary/markdown fences,
+                # repairs truncated JSON) — a bare json.loads() here
+                # previously failed outright on exactly those shapes,
+                # surfacing a generic "internal planning error" for
+                # something the codebase already knew how to handle.
+                plan = extract_json_object(raw_response.text)
                 tool_name  = plan.get("tool", "final_response")
                 tool_input = plan.get("tool_input")
                 thought    = plan.get("thought", "")
@@ -815,6 +975,29 @@ def run(
         elif tool_name == "execute_sql":
             instruction = tool_input or user_message
             context = build_execution_context(tool_name, instruction, user_intent=user_intent)
+
+            # Issue 7: the deterministic SQL builder can't diverge from
+            # intent by construction (it builds SQL directly FROM the
+            # structured frame) — this gap only exists for SQL the
+            # Gemini Executor writes freely. When the Gateway's own
+            # grounded frame already identified a specific aggregation
+            # (e.g. "total revenue" -> SUM(revenue)) but still routed here
+            # (e.g. because a JOIN made it non-deterministic), reuse that
+            # same structured expectation — via the identical
+            # frame_to_query_intent() the deterministic builder itself
+            # uses — to check the Executor's freely-written SQL actually
+            # reflects it, instead of trusting that valid-looking SQL
+            # necessarily answers the question asked.
+            expected_aggregations = None
+            if frame is not None:
+                try:
+                    from agent.semantic_frame import frame_to_query_intent
+                    _qi = frame_to_query_intent(frame)
+                    if _qi and _qi.aggregations:
+                        expected_aggregations = _qi.aggregations
+                except Exception:
+                    expected_aggregations = None
+
             tool_result = execute_sql(
                 instruction=instruction,
                 target_db=target_db,
@@ -824,6 +1007,7 @@ def run(
                 execution_context=context,
                 planning_doc=planning_doc,
                 pipeline_hint=pipeline_hint,
+                expected_aggregations=expected_aggregations,
             )
 
         elif tool_name == "get_schema_info":
@@ -1073,8 +1257,17 @@ def run(
                         or op_upper.startswith("QUERY")
                     )
                     if is_terminal_op:
-                        print(f"[Phase 8.1] Terminal successful SQL operation '{op}' detected, breaking loop immediately.")
-                        break
+                        completed_steps = step + 1
+                        if completed_steps < estimated_steps and completed_steps < _MAX_TOOL_CALLS:
+                            print(
+                                f"[Multi-step] '{op}' succeeded — completed {completed_steps} of an "
+                                f"estimated {estimated_steps} requested actions. Continuing instead of "
+                                f"stopping, so the rest of the request (e.g. sample data, a calculation, "
+                                f"a report) gets a chance to run in the same turn."
+                            )
+                        else:
+                            print(f"[Phase 8.1] Terminal successful SQL operation '{op}' detected, breaking loop immediately.")
+                            break
 
                 # ── Loop termination: RATE_LIMITED ────────────────────────────────
                 if intent == "RATE_LIMITED":
@@ -1136,10 +1329,24 @@ def run(
             print(f"[Phase 8] Loop terminated: terminal tool '{tool_name}'")
             break
 
-        # ── Phase 8.1 OPT-3: If keyword dispatch was used at step 0, break immediately ──
+        # ── Phase 8.1 OPT-3: If keyword dispatch was used at step 0, break immediately
+        # unless the message asked for more than this one deterministically-
+        # dispatched action — same estimated_steps gate as the is_terminal_op
+        # check above, kept consistent so a deterministically-dispatched first
+        # step (e.g. "create table X" recognized directly, bypassing the
+        # Local Planner entirely) doesn't get cut off any differently than
+        # an AI-Planner-routed one would.
         if first_tool_override and step == 0:
-            print(f"[Phase 8.1] Keyword dispatch tool '{tool_name}' completed, breaking loop immediately.")
-            break
+            completed_steps = step + 1
+            if completed_steps < estimated_steps and completed_steps < _MAX_TOOL_CALLS:
+                print(
+                    f"[Multi-step] Deterministically-dispatched tool '{tool_name}' completed step 1 of an "
+                    f"estimated {estimated_steps} requested actions — continuing so the AI Executor can "
+                    f"handle the rest (it sees the full original request plus what's already been done)."
+                )
+            else:
+                print(f"[Phase 8.1] Keyword dispatch tool '{tool_name}' completed, breaking loop immediately.")
+                break
 
     else:
         # Loop exhausted without a break

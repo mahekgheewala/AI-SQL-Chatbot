@@ -69,6 +69,30 @@ _PREFIX = "[TYPO_INTENT]"
 _spell = SpellChecker()
 
 
+def _adjacent_transposition_match(word: str, pool: set[str]) -> str | None:
+    """Check whether swapping any two adjacent letters in `word` produces a
+    word already in `pool` (SQL keywords + real schema identifiers).
+
+    Catches the extremely common "typed too fast" typo class (e.g. "tbale"
+    for "table") that the fuzzy-ratio scorer in _correct_text() rates far
+    below its similarity cutoff — a single adjacent swap changes a large
+    fraction of a short word's character *positions* even though it's one
+    keystroke slip, so fuzz.ratio's block-matching approach underrates it.
+    Checked directly against the same trusted pool, before ever falling
+    back to fuzzy scoring.
+    """
+    if len(word) < 3:
+        return None
+    chars = list(word)
+    for i in range(len(chars) - 1):
+        chars[i], chars[i + 1] = chars[i + 1], chars[i]
+        candidate = "".join(chars)
+        if candidate != word and candidate in pool:
+            return candidate
+        chars[i], chars[i + 1] = chars[i + 1], chars[i]  # swap back
+    return None
+
+
 def _deelongate(word: str) -> str:
     """Collapse runs of 3+ identical characters to a single one.
 
@@ -211,6 +235,16 @@ def _correct_text(text: str) -> str:
         # Strategy A: Direct typo mapping (covers common SQL-grammar typos)
         if word_lower in _DIRECT_TYPO_MAP:
             corrected_map[word] = _DIRECT_TYPO_MAP[word_lower]
+            continue
+
+        # Strategy A.5: Adjacent-letter-transposition typos (e.g. "tbale" ->
+        # "table"). Tried before the fuzzy scorer below because a single
+        # swap in a short word scores well under that scorer's cutoff (see
+        # _adjacent_transposition_match's docstring) despite being an
+        # extremely common, unambiguous keystroke mistake.
+        transposed_match = _adjacent_transposition_match(word_lower, fuzzy_pool)
+        if transposed_match:
+            corrected_map[word] = transposed_match
             continue
 
         # Strategy B: Find the closest SQL keyword or real schema identifier

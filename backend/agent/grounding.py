@@ -109,8 +109,15 @@ def normalize_type(type_token: str) -> Optional[str]:
     base = raw.split("(")[0].strip().upper()
     length_suffix = raw[raw.index("("):] if "(" in raw else ""
 
+    # "DOUBLE PRECISION" used to be accepted here as a special case even
+    # though it was never actually in ALLOWED_COLUMN_TYPES (the documented
+    # single source of truth, also used by validation/schema_creator_
+    # validator.py's real column-type gate) — so a type normalized to it
+    # would pass this check but be rejected the moment real validation saw
+    # it. Only callers is capability_check._type_allowed(); no special
+    # case needed to keep the two gates in agreement.
     canonical = _TYPE_ALIASES.get(base, base)
-    if canonical in ALLOWED_COLUMN_TYPES or canonical == "DOUBLE PRECISION":
+    if canonical in ALLOWED_COLUMN_TYPES:
         return f"{canonical}{length_suffix}" if length_suffix else canonical
     return None
 

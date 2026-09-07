@@ -13,6 +13,7 @@ from typing import List, Optional
 from models.schemas import SemanticFrame
 from agent.capabilities import Capability, get_capability
 from agent import grounding as G
+from db.column_types import ALLOWED_COLUMN_TYPES
 
 
 @dataclass
@@ -87,13 +88,18 @@ def _invalid_type_present(frame: SemanticFrame, role: str) -> bool:
 
 
 def _type_allowed(type_token: str) -> bool:
+    # db.column_types.ALLOWED_COLUMN_TYPES is the documented single source
+    # of truth for which column types this app actually accepts — its own
+    # docstring records that this exact list was ONCE ALREADY duplicated
+    # and drifted between two other files before being consolidated there.
+    # This function used to keep a third, hand-copied set instead of
+    # importing it — which had already drifted again: "SMALLINT" and
+    # "REAL" passed this (early, frame-level) check but were then rejected
+    # by validation/schema_creator_validator.py's Gate 3 (the real
+    # authority), so a column typed that way looked accepted right up
+    # until it confusingly failed several steps later in the pipeline.
     primary = G.normalize_type(type_token) or str(type_token).upper()
-    allowed = {
-        "TEXT", "INTEGER", "INT", "SERIAL", "BIGINT", "SMALLINT", "BOOLEAN",
-        "BOOL", "DATE", "TIMESTAMP", "FLOAT", "REAL", "DOUBLE PRECISION",
-        "NUMERIC", "DECIMAL", "JSON", "JSONB", "UUID", "VARCHAR", "CHAR",
-    }
-    if primary in allowed:
+    if primary in ALLOWED_COLUMN_TYPES:
         return True
     if re_match_varchar_length(primary):
         return True
@@ -102,6 +108,43 @@ def _type_allowed(type_token: str) -> bool:
 
 def re_match_varchar_length(type_upper: str) -> bool:
     return bool(re.match(r"^VARCHAR\(\d+\)$", type_upper))
+
+
+# ── Column constraint validation ────────────────────────────────────────────
+# Whitelist-pattern based, mirroring _type_allowed()'s approach above — a
+# constraint clause is free text that gets interpolated directly into a
+# CREATE TABLE statement, so (like `type`) it's validated against known-safe
+# shapes rather than trusted as-is, regardless of whether it came from a
+# deterministic parse or an LLM proposal.
+_SIMPLE_CONSTRAINTS = {"PRIMARY KEY", "UNIQUE", "NOT NULL", "NULL"}
+
+_REFERENCES_PATTERN = re.compile(
+    r"^REFERENCES\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\)"
+    r"(?:\s+ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|RESTRICT|SET\s+NULL|SET\s+DEFAULT|NO\s+ACTION))*$",
+    re.IGNORECASE,
+)
+
+_DEFAULT_PATTERN = re.compile(
+    r"^DEFAULT\s+(?:'[^']*'|-?\d+(?:\.\d+)?|TRUE|FALSE|NULL|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME)$",
+    re.IGNORECASE,
+)
+
+
+def _constraint_allowed(token: str) -> bool:
+    """True if `token` is a recognized, safe constraint clause. Deliberately
+    does not attempt to support CHECK (...) — validating an arbitrary
+    boolean expression safely is a meaningfully bigger problem than the
+    fixed-shape clauses here, and out of scope for this fix; PRIMARY KEY /
+    UNIQUE / NOT NULL / NULL / REFERENCES / DEFAULT cover what was actually
+    found missing in the audit."""
+    t = token.strip()
+    if t.upper() in _SIMPLE_CONSTRAINTS:
+        return True
+    if _REFERENCES_PATTERN.match(t):
+        return True
+    if _DEFAULT_PATTERN.match(t):
+        return True
+    return False
 
 
 def _clarification_message(capability: Capability, frame: SemanticFrame,
@@ -157,6 +200,19 @@ def _clarification_message(capability: Capability, frame: SemanticFrame,
         return "Which column should this operation target?"
     if role == "chart":
         return "What kind of chart would you like to see?"
+    if role == "measure":
+        # The chart request named a measure word that isn't a real column
+        # on this table ("plot bogus by department") — the completeness
+        # check upstream used to only verify a ChartSpec object existed at
+        # all, not that its measure actually resolved, so this silently
+        # built a chart with no data to plot instead of asking.
+        candidates = list((metadata or {}).get("columns_by_table", {}).get(frame.table, [])) if frame.table else []
+        if candidates:
+            return (
+                "I couldn't tell which column you want to plot. Did you mean one of: "
+                f"{', '.join(candidates)}?"
+            )
+        return "Which column would you like to plot?"
     if role == "count":
         return "How many sample rows would you like to add?"
     if role == "ordering_column":

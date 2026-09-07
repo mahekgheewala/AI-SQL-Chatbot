@@ -14,6 +14,8 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, nullable=True)
+    pending_email = Column(String, nullable=True)
     password_hash = Column(String, nullable=False)
     role = Column(Enum(Role), default=Role.USER, nullable=False)
     is_active = Column(Boolean, default=True)

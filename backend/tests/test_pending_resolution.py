@@ -125,3 +125,38 @@ def test_other_capability_table_resolution_unaffected():
     result = resolve_pending_clarification("employees", pending)
     assert result["resolved"] is True
     assert result["reconstructed_request"] == "show me everything employees"
+
+
+# ─── CREATE_TABLE_NAME — natural-phrasing replies must not re-ask forever ───
+# Found via a multi-turn follow-up audit: "create a table" (no name given)
+# asks "what would you like to name it?", but ANY natural reply other than
+# a single bare word ("call it products", "name it orders") failed the
+# bare-identifier check with no fallback, so resolve_pending_clarification()
+# returned unresolved every single time — the caller just re-asked the
+# IDENTICAL question forever. No reply could ever get past it.
+
+def test_create_table_name_bare_word_still_resolves():
+    pending = {"type": "CREATE_TABLE_NAME", "original_request": "create a table", "target_db": "hr_database"}
+    result = resolve_pending_clarification("products", pending)
+    assert result["resolved"] is True
+    assert result["selected_option"] == "products"
+
+
+def test_create_table_name_natural_phrasing_resolves():
+    pending = {"type": "CREATE_TABLE_NAME", "original_request": "create a table", "target_db": "hr_database"}
+    for reply, expected in [
+        ("call it products", "products"),
+        ("name it orders", "orders"),
+        ("call the table customers", "customers"),
+    ]:
+        result = resolve_pending_clarification(reply, pending)
+        assert result["resolved"] is True, f"{reply!r} should have resolved"
+        assert result["selected_option"] == expected, f"{reply!r} -> {result['selected_option']!r}, expected {expected!r}"
+
+
+def test_create_table_name_unparseable_reply_still_asks_again():
+    # A reply carrying no extractable name at all must still (correctly)
+    # come back unresolved — this fix adds a fallback, not a guarantee.
+    pending = {"type": "CREATE_TABLE_NAME", "original_request": "create a table", "target_db": "hr_database"}
+    result = resolve_pending_clarification("um, not sure", pending)
+    assert result["resolved"] is False

@@ -19,10 +19,13 @@ WARNING: These endpoints expose raw log data including SQL, session IDs,
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from auth.dependencies import get_current_admin
+from db.app_database import get_db
 from models.domain import User
 from monitoring.log_reader import read_logs
 from monitoring.analytics import get_analytics
@@ -173,3 +176,43 @@ async def export_logs(
             media_type="application/json",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+
+
+# ─── User Management ──────────────────────────────────────────────────────────
+# New users appear here automatically — this reads live from the users table
+# on every call, there is no separate registry to keep in sync.
+
+@router.get("/users")
+def list_users(current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)) -> dict:
+    """List every user with their name, role, status, and how many
+    databases they've created through the app — auto-updates as soon as
+    someone signs up or creates a database, since it's read live."""
+    from services.user_service import UserService
+    return {"users": UserService(db).list_users_with_database_counts()}
+
+
+class UpdateUserStatusRequest(BaseModel):
+    is_active: Optional[bool] = None
+    role: Optional[str] = None
+
+
+@router.patch("/users/{user_id}")
+def update_user_status(
+    user_id: int,
+    request: UpdateUserStatusRequest,
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Suspend/reactivate a user and/or change their role. Suspending
+    immediately revokes their active sessions, not just future logins."""
+    if user_id == current_admin.id and request.is_active is False:
+        raise HTTPException(status_code=400, detail="Cannot suspend your own account")
+    from services.user_service import UserService
+    try:
+        user = UserService(db).set_user_status(user_id, is_active=request.is_active, role=request.role)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {
+        "id": user.id, "email": user.email, "role": user.role.value,
+        "is_active": user.is_active,
+    }

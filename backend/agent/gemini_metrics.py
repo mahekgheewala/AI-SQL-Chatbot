@@ -48,9 +48,18 @@ def estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
 
 
 # ── Cumulative call counters ──────────────────────────────────────────────────
+# NOTE on "planner": this label is the Gemini Executor call in
+# agent_coordinator.py (picks a tool + writes SQL from the Local Planner's
+# plan) — named "planner" for historical reasons predating the current
+# two-model architecture. It is NOT the Groq Local Planner, which has its
+# own "local_planner" label below. Kept as "planner" rather than renamed to
+# avoid a wide, purely-cosmetic rename across monitoring/analytics.py,
+# main.py's debug endpoint, and existing tests that all key off this exact
+# string today.
 _calls: dict[str, Any] = {
     "router":           0,
-    "planner":          0,
+    "local_planner":    0,   # Groq Local Planner (agent/local_planner.py) — decides WHAT to do
+    "planner":          0,   # Gemini Executor (agent_coordinator.py) — decides HOW (tool + SQL); see NOTE above
     "sql_generator":    0,
     "summarizer":       0,
     "report_formatter": 0,
@@ -83,7 +92,8 @@ _active_request: ContextVar[dict] = ContextVar("_active_request", default={})
 
 GC_MAPPING = {
     "router": "GC-01 Router",
-    "planner": "GC-02 Planner",
+    "local_planner": "GC-02a Local Planner (Groq)",
+    "planner": "GC-02b Gemini Executor",
     "sql_generator": "GC-03 SQL Generator",
     "summarizer": "GC-04 Summarizer",
     "report_formatter": "GC-05 Report Formatter",
@@ -157,7 +167,9 @@ def get_active_request_summary() -> dict:
             largest_prompt_label, largest_prompt_tokens = "None", 0
             
     return {
+        "calls":            calls,   # ordered sequence of call labels for this request
         "router":           calls.count("router"),
+        "local_planner":    calls.count("local_planner"),
         "planner":          calls.count("planner"),
         "sql_generator":    calls.count("sql_generator"),
         "summarizer":       calls.count("summarizer"),
@@ -230,7 +242,7 @@ def record_call(label: str) -> None:
     Increment the cumulative counter for a Gemini call site and append the label
     to the current request's call sequence.
 
-    Valid labels: "router", "planner", "sql_generator", "summarizer", "report_formatter"
+    Valid labels: "router", "local_planner", "planner", "sql_generator", "summarizer", "report_formatter"
     """
     with _lock:
         _calls[label]    = _calls.get(label, 0) + 1

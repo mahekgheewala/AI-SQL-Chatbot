@@ -24,3 +24,6 @@ class UserRepository:
         self.db.commit()
         self.db.refresh(user)
         return user
+
+    def list_users(self) -> list[User]:
+        return self.db.query(User).order_by(User.created_at.desc()).all()

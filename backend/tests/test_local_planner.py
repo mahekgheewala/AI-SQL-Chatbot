@@ -250,7 +250,8 @@ class TestLocalPlannerUnit(unittest.TestCase):
         # Model returns an invalid planning_mode JSON
         mock_call.return_value = (
             self._make_raw("", planning_mode="UNKNOWN_MODE", database_context=None),
-            0.1
+            0.1,
+            {"prompt_tokens": 0, "completion_tokens": 0}
         )
         res = plan("test query", {}, "context", [])
         pdoc = res["planning_document"]
@@ -316,7 +317,8 @@ class TestLocalPlannerUnit(unittest.TestCase):
                 planner_confidence=0.95,
                 estimated_execution_type="sql_query",
             ),
-            0.15
+            0.15,
+            {"prompt_tokens": 120, "completion_tokens": 45}
         )
         res = plan("hello", {}, "context", [])
         self.assertEqual(res["schema_version"], "1.0")
@@ -373,7 +375,8 @@ class TestPlannerIntegration(unittest.TestCase):
                 clarification_required=True,
                 clarification_question="What columns?",
             ),
-            0.05
+            0.05,
+            {"prompt_tokens": 90, "completion_tokens": 30}
         )
 
         from agent.agent_coordinator import run as coordinator_run
@@ -427,7 +430,8 @@ class TestPlannerIntegration(unittest.TestCase):
                 clarification_required=False,
                 clarification_question=None,
             ),
-            0.05
+            0.05,
+            {"prompt_tokens": 150, "completion_tokens": 60}
         )
 
         # Gemini Executor mock response (final response)

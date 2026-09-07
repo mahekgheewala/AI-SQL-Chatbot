@@ -67,6 +67,93 @@ def _extract_table_name(intent: str, sql: str) -> Optional[str]:
         return None
 
 
+# SQL reserved words/functions a bare-identifier check must never mistake
+# for a column reference.
+_SQL_RESERVED_FOR_BARE_COLUMNS = frozenset({
+    "select", "from", "where", "and", "or", "not", "null", "is", "in",
+    "like", "between", "group", "by", "order", "asc", "desc", "limit",
+    "offset", "as", "distinct", "having", "on", "join", "inner", "left",
+    "right", "outer", "full", "cross", "true", "false",
+    "count", "sum", "avg", "min", "max",
+})
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    """Split on commas that aren't inside parentheses (so a function call
+    like COUNT(a, b) isn't split apart)."""
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
+def _extract_bare_select_columns(sql: str) -> list[str]:
+    """Bare (unqualified, no function call, no '*', no expression) column
+    names in the SELECT list — e.g. "name", "salary" from
+    "SELECT name, salary FROM t". A column with "AS alias" keeps the
+    column, not the alias. Anything containing "(" (function calls like
+    COUNT(x)) or "." (already-qualified, checked above) or more than one
+    token (an expression like "salary * 2") is left unchecked rather than
+    risk a false positive on something this simple extraction can't
+    confidently parse."""
+    m = re.search(r"\bSELECT\s+(?:DISTINCT\s+)?(.+?)\s+FROM\b", sql, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return []
+    cols = []
+    for part in _split_top_level_commas(m.group(1)):
+        part = part.strip()
+        if not part or part == "*" or "(" in part or "." in part:
+            continue
+        base = re.split(r"\s+AS\s+", part, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        base_tokens = base.split()
+        if (
+            len(base_tokens) == 1
+            and re.match(r"^[a-zA-Z_]\w*$", base_tokens[0])
+            and base_tokens[0].lower() not in _SQL_RESERVED_FOR_BARE_COLUMNS
+        ):
+            cols.append(base_tokens[0])
+    return cols
+
+
+def _extract_bare_where_columns(sql: str) -> list[str]:
+    """Bare (unqualified) column names in the WHERE clause, identified by
+    appearing directly before a comparison operator or LIKE/IN/IS/BETWEEN
+    — the shape a real filter condition always takes, so this doesn't
+    need to parse the full expression grammar to find them safely."""
+    m = re.search(
+        r"\bWHERE\s+(.+?)(?:\s+GROUP\s+BY\b|\s+ORDER\s+BY\b|\s+LIMIT\b|\s+OFFSET\b|$)",
+        sql, re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return []
+    where_text = m.group(1)
+    cols = []
+    for pm in re.finditer(
+        r"\b([a-zA-Z_]\w*)\s*(?:=|!=|<>|<=|>=|<|>|\bLIKE\b|\bIN\b|\bIS\b|\bBETWEEN\b)",
+        where_text, re.IGNORECASE,
+    ):
+        col = pm.group(1)
+        start = pm.start(1)
+        if start > 0 and where_text[start - 1] == ".":
+            continue  # already-qualified reference, checked above
+        if col.lower() in _SQL_RESERVED_FOR_BARE_COLUMNS:
+            continue
+        cols.append(col)
+    return cols
+
+
 def _extract_set_columns(sql: str) -> list[str]:
     """
     Extract the column names referenced in the SET clause of an UPDATE statement.
@@ -168,6 +255,31 @@ def check_schema(intent: str, sql: Optional[str], schema: dict) -> dict:
                     "valid": False,
                     "reason": (
                         f"Column '{m.group(2)}' does not exist in table '{actual_t}'. "
+                        f"Available columns in '{actual_t}': {', '.join(schema.get(actual_t, []))}."
+                    ),
+                }
+
+    # ── Unqualified column check (single-table queries only) ──────────────────
+    # Only the qualified form (table.column / alias.column) was checked
+    # above — but that's not how most SQL is actually written. A plain
+    # "SELECT name, salary FROM employees WHERE age > 30" has no
+    # table-qualified columns at all, so name/salary/age previously went
+    # completely unchecked here and only failed later, at the database
+    # itself, with a raw error instead of this gate's friendly message.
+    # Scoped to single-table queries (no JOIN) — with more than one table
+    # in play, which table an unqualified column belongs to is genuinely
+    # ambiguous from this lightweight extraction, so it's left unchecked
+    # rather than risk guessing wrong.
+    table_ref_count = len(pattern_table_alias.findall(sql))
+    if table_ref_count <= 1 and table_name.lower() in schema_tables_lower:
+        actual_t = schema_tables_lower[table_name.lower()]
+        actual_cols_lower = {c.lower() for c in schema.get(actual_t, [])}
+        for col in _extract_bare_select_columns(sql) + _extract_bare_where_columns(sql):
+            if col.lower() not in actual_cols_lower:
+                return {
+                    "valid": False,
+                    "reason": (
+                        f"Column '{col}' does not exist in table '{actual_t}'. "
                         f"Available columns in '{actual_t}': {', '.join(schema.get(actual_t, []))}."
                     ),
                 }

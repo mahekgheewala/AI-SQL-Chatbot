@@ -98,16 +98,73 @@ _TRUNCATE_PATTERN: re.Pattern = re.compile(r'\bTRUNCATE\b', re.IGNORECASE)
 # execute without its own confirmation (e.g. a confirmed UPDATE smuggling an
 # unconfirmed DROP TABLE). String literals and comments are stripped first so
 # a semicolon inside a quoted value or a comment doesn't cause a false positive.
-_STRING_LITERAL_PATTERN: re.Pattern = re.compile(r"'(?:[^']|'')*'")
-_BLOCK_COMMENT_PATTERN: re.Pattern = re.compile(r'/\*.*?\*/', re.DOTALL)
-_LINE_COMMENT_PATTERN: re.Pattern = re.compile(r'--[^\n]*')
+
+
+def _strip_strings_and_comments(sql: str) -> str:
+    """Single left-to-right pass that blanks out quoted-string contents and
+    comments, tracking exactly one state at a time (normal code / inside a
+    quoted string / inside a line comment / inside a block comment).
+
+    Replaces a previous two-independent-regex-pass approach (strip quoted
+    strings first, then separately strip comments) that could be tricked:
+    a stray, unmatched quote character sitting inside one comment could
+    pair up with another stray quote sitting inside a LATER, unrelated
+    comment on a different line, and everything in between — including a
+    real, executable second SQL statement and its semicolon — would get
+    swallowed as if it were all one quoted string before comment-stripping
+    or statement-counting ever ran, making a genuine second statement
+    invisible to this check. A single-pass scanner that always knows which
+    state it's in as it reads cannot make that mistake in either direction
+    (a quote inside a real comment, or "--"/"/*" inside a real string, are
+    both handled correctly, since only one state ever applies at a time).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+
+        if ch == "'":
+            # Inside a single-quoted string: only a doubled '' (the SQL
+            # escape for a literal quote) or the real closing quote ends
+            # this state — a "--" or "/*" encountered in here is just data.
+            out.append("'")
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        out.append("''")
+                        i += 2
+                        continue
+                    out.append("'")
+                    i += 1
+                    break
+                out.append(" ")
+                i += 1
+            continue
+
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            i += 2
+            while i < n and sql[i] != "\n":
+                i += 1
+            continue
+
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            i += 2
+            while i < n and not (sql[i] == "*" and i + 1 < n and sql[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
 
 
 def _has_multiple_statements(sql: str) -> bool:
     """True if `sql` contains more than one SQL statement."""
-    stripped = _STRING_LITERAL_PATTERN.sub("''", sql)
-    stripped = _BLOCK_COMMENT_PATTERN.sub(" ", stripped)
-    stripped = _LINE_COMMENT_PATTERN.sub(" ", stripped)
+    stripped = _strip_strings_and_comments(sql)
     statements = [s.strip() for s in stripped.split(";")]
     return len([s for s in statements if s]) > 1
 

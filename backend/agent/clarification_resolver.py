@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from models.schemas import ColumnSpec
@@ -43,7 +43,7 @@ def _call_llm(prompt: str) -> Optional[str]:
     """Groq-first, Gemini-fallback text completion. Never raises."""
     try:
         from agent.local_planner import _call_groq_planner
-        text, _elapsed = _call_groq_planner(prompt)
+        text, _elapsed, _usage = _call_groq_planner(prompt)
         if text:
             return text
     except Exception as e:
@@ -100,6 +100,42 @@ class TableColumnsResolution:
     table_name: Optional[str] = None
     columns: Optional[List[ColumnSpec]] = None
     reason: Optional[str] = None
+    # Names of columns whose type wasn't given by the user and was picked
+    # by _guess_column_type() instead — carried through so the caller can
+    # tell the user honestly what was assumed, rather than silently
+    # defaulting with no visibility (see _build_success_reply() in
+    # agent_coordinator.py, which reads this).
+    defaulted_columns: List[str] = field(default_factory=list)
+
+
+# Column-name patterns used to pick a more sensible default type than a
+# blanket TEXT when the user didn't specify one — checked in order, first
+# match wins. Never silent: resolve_create_table_slots() always reports
+# which columns used a guessed type via defaulted_columns above.
+_TYPE_GUESS_PATTERNS: List[tuple] = [
+    (("_id", "_uuid"), "INTEGER"),
+    (("price", "amount", "salary", "cost", "total", "balance", "revenue", "fee", "quantity"), "NUMERIC"),
+    (("date", "_at", "time", "created", "updated"), "DATE"),
+]
+_TYPE_GUESS_PREFIXES = (("is_", "BOOLEAN"), ("has_", "BOOLEAN"))
+
+
+def _guess_column_type(name: str) -> str:
+    """Heuristic default type for a column with no type given, based on
+    common naming conventions — used only as a fallback when neither the
+    user nor the LLM specified one. Always disclosed to the user
+    afterward (see TableColumnsResolution.defaulted_columns), never a
+    silent guess."""
+    n = name.lower()
+    if n == "id":
+        return "INTEGER"
+    for prefix, sql_type in _TYPE_GUESS_PREFIXES:
+        if n.startswith(prefix):
+            return sql_type
+    for hints, sql_type in _TYPE_GUESS_PATTERNS:
+        if any(h in n for h in hints):
+            return sql_type
+    return "TEXT"
 
 
 def _build_create_table_prompt(original_request: str, missing: List[str],
@@ -122,16 +158,24 @@ CREATE TABLE request, so the table name may be new): {tables}
 RULES:
 - Extract ONLY what the user actually specified in their reply (and, if
   relevant, the original request). Do not invent a table name, column name,
-  or column type that wasn't stated or clearly implied.
-- If something is still not determinable from the text, use null for it —
-  do not guess.
+  column type, or constraint that wasn't stated or clearly implied.
+- If something is still not determinable from the text, use null (or an
+  empty list, for constraints) for it — do not guess.
 - A column the user named without a type should still be included, with
   "type": null.
+- If the user described a constraint for a column (primary key, unique,
+  required/not null, a default value, or a reference to another table —
+  e.g. "id as primary key", "email should be unique", "name is required",
+  "customer_id should reference customers(id)"), extract it into that
+  column's "constraints" list, written as valid PostgreSQL constraint
+  syntax: "PRIMARY KEY", "UNIQUE", "NOT NULL", "DEFAULT <value>", or
+  "REFERENCES <table>(<column>)". Do not invent a constraint that wasn't
+  stated.
 
 Respond with ONLY a single JSON object, no commentary, no markdown fences:
 {{
   "table_name": "<name>" | null,
-  "columns": [{{"name": "<name>", "type": "<sql type>" | null}}, ...] | null,
+  "columns": [{{"name": "<name>", "type": "<sql type>" | null, "constraints": ["<constraint>", ...]}}, ...] | null,
   "confidence": <float 0.0-1.0>
 }}
 """
@@ -144,7 +188,7 @@ def resolve_create_table_slots(
     metadata: dict,
     known_table: Optional[str] = None,
 ) -> TableColumnsResolution:
-    from agent.capability_check import _type_allowed
+    from agent.capability_check import _type_allowed, _constraint_allowed
     from agent.pending_resolution import _FORBIDDEN_COLUMN_NAMES
 
     prompt = _build_create_table_prompt(original_request, missing, user_reply, metadata)
@@ -169,6 +213,7 @@ def resolve_create_table_slots(
         table_name = None
 
     columns: Optional[List[ColumnSpec]] = None
+    defaulted_columns: List[str] = []
     raw_columns = data.get("columns")
     if raw_columns:
         if not isinstance(raw_columns, list):
@@ -190,7 +235,23 @@ def resolve_create_table_slots(
             col_type = str(col_type).strip() if col_type else None
             if col_type and not _type_allowed(col_type):
                 return TableColumnsResolution(ok=False, reason=f"LLM-proposed column type {col_type!r} is not a recognized SQL type")
-            parsed_columns.append(ColumnSpec(name=name, type=col_type or "TEXT"))
+            if col_type:
+                final_type = col_type
+            else:
+                final_type = _guess_column_type(name)
+                defaulted_columns.append(name)
+            raw_constraints = col.get("constraints") or []
+            if not isinstance(raw_constraints, list):
+                return TableColumnsResolution(ok=False, reason=f"LLM-proposed constraints for column {name!r} was not a list")
+            constraints: List[str] = []
+            for c in raw_constraints:
+                c = str(c).strip()
+                if not c:
+                    continue
+                if not _constraint_allowed(c):
+                    return TableColumnsResolution(ok=False, reason=f"LLM-proposed constraint {c!r} for column {name!r} is not a recognized/safe constraint")
+                constraints.append(c.upper() if c.upper() in {"PRIMARY KEY", "UNIQUE", "NOT NULL", "NULL"} else c)
+            parsed_columns.append(ColumnSpec(name=name, type=final_type, constraints=constraints))
         if not parsed_columns:
             return TableColumnsResolution(ok=False, reason="LLM returned an empty columns list")
         columns = parsed_columns
@@ -198,7 +259,7 @@ def resolve_create_table_slots(
     if not table_name and not columns:
         return TableColumnsResolution(ok=False, reason="LLM could not extract a table name or columns from this reply")
 
-    return TableColumnsResolution(ok=True, table_name=table_name, columns=columns)
+    return TableColumnsResolution(ok=True, table_name=table_name, columns=columns, defaulted_columns=defaulted_columns)
 
 
 # ─── ADD SAMPLE DATA generation ──────────────────────────────────────────────

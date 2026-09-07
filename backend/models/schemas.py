@@ -95,6 +95,12 @@ class ColumnSpec(BaseModel):
     type: Optional[str] = None
     drop: bool = False          # True => DROP COLUMN
     new_name: Optional[str] = None   # rename target (RENAME COLUMN)
+    # Structural fix for the audit finding that constraints (PRIMARY KEY,
+    # UNIQUE, NOT NULL, DEFAULT, REFERENCES) had nowhere to be represented
+    # in this model at all — a list of individually-validated constraint
+    # clauses (see agent/capability_check.py's _constraint_allowed()),
+    # e.g. ["PRIMARY KEY"], ["NOT NULL", "UNIQUE"], ["REFERENCES customers(id)"].
+    constraints: List[str] = []
 
 
 class AlterSpec(BaseModel):

@@ -21,7 +21,7 @@ from agent.semantic_frame import (
     STATUS_CLARIFY,
     STATUS_FAILED,
 )
-from models.schemas import SemanticFrame
+from models.schemas import SemanticFrame, ChartSpec
 
 # ─── Synthetic metadata matching the baseline hr_database fixture ────────────
 
@@ -66,6 +66,31 @@ WIDGETS_METADATA = {
 
 def run(message: str, context: dict = None):
     return interpret_message(message, HR_METADATA, context or {})
+
+
+# Dedicated fixture for the multi-clause / comparative-filter regression
+# tests below — has an "age" and "status" column that HR_METADATA
+# deliberately does NOT have (other tests above rely on "no age-like
+# column exists on employees" as their premise; adding one there would
+# break those tests' meaning).
+PEOPLE_METADATA = {
+    "databases": ["people_db"],
+    "active_database": "people_db",
+    "tables": ["people"],
+    "all_tables_by_db": {"people_db": ["people"]},
+    "columns_by_table": {
+        "people": ["id", "name", "department", "salary", "age", "status", "sales"],
+    },
+    "column_types_by_table": {
+        "people": {"id": "integer", "name": "text", "department": "text",
+                   "salary": "numeric", "age": "integer", "status": "text",
+                   "sales": "numeric"},
+    },
+}
+
+
+def run_people(message: str, context: dict = None):
+    return interpret_message(message, PEOPLE_METADATA, context or {})
 
 
 # ─── Greetings ───────────────────────────────────────────────────────────────
@@ -198,6 +223,41 @@ def test_add_column_missing_table():
     assert "table" in r.frame.missing_required
 
 
+def test_drop_column_name_before_keyword():
+    # "drop the X column" — the column name comes BEFORE the word "column",
+    # not after. Only "drop column X" (name after) was handled; this at
+    # least as natural phrasing found no column name at all despite one
+    # being named right there in the sentence.
+    r = run("drop the salary column from employees")
+    assert r.status == STATUS_SUCCESS
+    assert r.frame.capability_id == "drop_column"
+    assert r.frame.alter.column == "salary"
+    assert r.frame.table == "employees"
+
+
+def test_drop_column_does_not_grab_table_name_across_from():
+    # The forward scan used to skip straight past "from" looking for the
+    # next identifier, which could walk past the column/table boundary and
+    # grab the TABLE name as if it were the column ("...from employees" ->
+    # column="employees").
+    r = run("delete the salary column from employees")
+    assert r.status == STATUS_SUCCESS
+    assert r.frame.alter.column == "salary"
+    assert r.frame.alter.column != "employees"
+
+
+def test_alter_column_followup_carries_table_from_prior_turn():
+    # "now drop the status column" right after "describe employees" names
+    # no table at all — same missing-context-threading gap
+    # _parse_add_sample_data had before it was fixed.
+    prior = SemanticFrame(action="describe", object_type="TABLE",
+                          capability_id="describe_table", table="employees")
+    r = run("drop the salary column", {"prior_frames": [prior]})
+    assert r.status == STATUS_SUCCESS
+    assert r.frame.table == "employees"
+    assert r.frame.alter.column == "salary"
+
+
 # ─── Add sample data ─────────────────────────────────────────────────────────
 
 def test_add_sample_data_with_count():
@@ -223,6 +283,45 @@ def test_add_sample_data_missing_table():
     assert "table" in r.frame.missing_required
 
 
+def test_add_sample_data_followup_carries_table_from_prior_turn():
+    # Found via a multi-turn follow-up audit: "add sample data to
+    # employees" then "add 5 more" — the second message names no table at
+    # all. _parse_retrieve/_parse_visualize already fall back to the prior
+    # turn's table in this situation; _parse_add_sample_data never did,
+    # losing the table entirely on the very next turn.
+    prior = SemanticFrame(action="add", object_type="DATA",
+                          capability_id="add_sample_data", table="employees")
+    r = run("add 5 more", {"prior_frames": [prior]})
+    assert r.status == STATUS_SUCCESS
+    assert r.frame.capability_id == "add_sample_data"
+    assert r.frame.table == "employees"
+    assert r.frame.sample_data.count == 5
+
+
+def test_add_sample_data_bare_more_recognized_as_action():
+    # "add more" (no number, no "rows"/"records"/"sample data") previously
+    # matched none of the add_sample_data action triggers at all and fell
+    # through to capability_id="understanding_failed" — there is no other
+    # capability "add more" could sensibly mean in this app.
+    prior = SemanticFrame(action="add", object_type="DATA",
+                          capability_id="add_sample_data", table="employees")
+    r = run("add more", {"prior_frames": [prior]})
+    assert r.status == STATUS_SUCCESS
+    assert r.frame.capability_id == "add_sample_data"
+    assert r.frame.table == "employees"
+
+
+def test_add_sample_data_count_from_bare_more():
+    # "add 10 more" — no "rows"/"records"/"data"/etc. at all, just "more".
+    # The count regex only recognized a fixed unit-word list that didn't
+    # include "more", so "10" was silently discarded and the caller
+    # defaulted to a hardcoded 5 regardless of what was actually asked for.
+    prior = SemanticFrame(action="add", object_type="DATA",
+                          capability_id="add_sample_data", table="employees")
+    r = run("add 10 more", {"prior_frames": [prior]})
+    assert r.frame.sample_data.count == 10
+
+
 # ─── Visualize ───────────────────────────────────────────────────────────────
 
 def test_visualize_bar_chart():
@@ -241,6 +340,31 @@ def test_visualize_pie_chart_with_table():
     assert r.frame.chart.chart_type == "pie"
     assert r.frame.chart.dimension == "department"
     assert r.frame.table == "employees"
+
+
+def test_visualize_unresolvable_measure_asks_instead_of_building_empty_chart():
+    # "bogus" is not a real column on any table — the completeness check
+    # used to only verify a ChartSpec object existed at all, not that its
+    # measure actually resolved, so this silently built a chart with
+    # measure=None (nothing to plot) instead of asking what to plot.
+    r = run("plot bogus by department")
+    assert r.status == STATUS_CLARIFY
+    assert "measure" in r.frame.missing_required
+
+
+def test_visualize_chart_type_followup_keeps_prior_measure_and_dimension():
+    # "now show it as a pie chart" only changes the chart TYPE — a person
+    # wouldn't re-state "salary by department" just to switch chart types.
+    # Without inheriting the prior turn's chart spec, the new chart
+    # silently had no measure or dimension at all.
+    prior = SemanticFrame(action="visualize", object_type="CHART", capability_id="visualize",
+                          table="employees",
+                          chart=ChartSpec(chart_type="bar", measure="salary", dimension="department"))
+    r = run("now show it as a pie chart", {"prior_frames": [prior]})
+    assert r.status == STATUS_SUCCESS
+    assert r.frame.chart.chart_type == "pie"
+    assert r.frame.chart.measure == "salary"
+    assert r.frame.chart.dimension == "department"
 
 
 # ─── Switch database ─────────────────────────────────────────────────────────
@@ -263,6 +387,26 @@ def test_switch_database_no_target():
     r = run("switch database")
     assert r.status == STATUS_CLARIFY
     assert "Which database" in (r.clarification_message or "")
+
+
+def test_bare_use_of_nonexistent_word_is_not_database_switch():
+    # "now use headcount instead" (a chart follow-up asking for a
+    # different measure) used to always be read as "switch database to
+    # headcount" purely because it contains the word "use" — even though
+    # "headcount" isn't a database at all. "use" alone is genuinely
+    # ambiguous; only commit to database-switch when the word after it is
+    # a real database, or "database"/"db" is explicitly said.
+    r = run("now use headcount instead")
+    assert r.frame.capability_id != "switch_database"
+
+
+def test_use_with_real_database_still_switches():
+    # "use" on its own DOES still mean switch-database when it's actually
+    # followed by a real database name — this fix must not break that.
+    r = run("use another")
+    assert r.status == STATUS_SUCCESS
+    assert r.frame.capability_id == "switch_database"
+    assert r.frame.database == "another"
 
 
 # ─── List / describe ─────────────────────────────────────────────────────────
@@ -352,6 +496,19 @@ def test_retrieve_bad_filter_column_is_clarification():
     assert "nonexistentcol" in (r.clarification_message or "")
 
 
+def test_retrieve_typo_filter_does_not_duplicate():
+    # "salry" (typo for "salary") gets caught by TWO independent filter
+    # parsers in the same pass — one keeps the raw typo'd spelling, the
+    # other resolves it correctly via fuzzy matching — so they look like
+    # different filters until BOTH get grounded to the real column name.
+    # The dedup pass in _build_frame runs before grounding, so it missed
+    # this; only a second dedup after grounding catches it.
+    r = run("show employees with salry over 50000")
+    assert r.status == STATUS_SUCCESS
+    assert len(r.frame.filters) == 1
+    assert r.frame.filters[0].column == "salary"
+
+
 # ─── Superlatives & comparatives — schema-driven, never a hardcoded word map ─
 
 def test_superlative_scalar_aggregation_resolves_real_column():
@@ -404,6 +561,146 @@ def test_comparative_filter_implicit_attribute_no_match_asks():
     r = run("show employees older than 30")
     assert r.status == STATUS_CLARIFY
     assert "ordering_column" in r.frame.missing_required
+
+
+# ─── Multi-clause / "universal query" regressions ────────────────────────────
+# One message filtering on more than one column, or phrasing a filter in a
+# way that has no explicit operator word, or a comparative sentence whose
+# real column word sits behind a grammar word ("is", "are") — all silently
+# dropped data or asked an unanswerable question before being fixed. Each
+# test below pins down the exact broken sentence so a future change to
+# semantic_frame.py can't quietly reintroduce the same drop.
+
+def test_retrieve_two_comparative_filters_on_different_columns():
+    # Previously only the FIRST "<col> over/under N" clause survived —
+    # re.search() found one match and never looked for a second.
+    r = run_people("find people with age over 30 and salary under 100000")
+    assert r.status == STATUS_SUCCESS
+    filters = {(f.column, f.operator, f.value) for f in r.frame.filters}
+    assert ("age", ">", "30") in filters
+    assert ("salary", "<", "100000") in filters
+
+
+def test_retrieve_older_than_resolves_to_age_column():
+    # "older than" used to be resolved as if the WORD "older" itself were a
+    # candidate column name — it never matches any real column, so this
+    # incorrectly asked for clarification even when a real "age" column
+    # exists right there in the schema.
+    r = run_people("find people older than 30")
+    assert r.status == STATUS_SUCCESS
+    filters = [f for f in r.frame.filters if f.column == "age"]
+    assert filters and filters[0].operator == ">" and filters[0].value == "30"
+
+
+def test_retrieve_comparative_filter_skips_grammar_word():
+    # The word directly before "over" here is "is" (a grammar word), not
+    # the real attribute "age" — used to be taken literally, fail to
+    # resolve, and wrongly ask for clarification even though "age over 30"
+    # further left in the sentence already parsed correctly on its own.
+    r = run_people("find people whose age is over 30")
+    assert r.status == STATUS_SUCCESS
+    filters = [f for f in r.frame.filters if f.column == "age"]
+    assert filters and filters[0].operator == ">" and filters[0].value == "30"
+
+
+def test_retrieve_top_n_by_column_infers_ordering():
+    # "top 5 X by Y" means the 5 HIGHEST Y, not 5 arbitrary rows — the "by
+    # salary" half used to be silently dropped, leaving a LIMIT with no
+    # ORDER BY at all.
+    r = run_people("top 2 people by salary")
+    assert r.status == STATUS_SUCCESS
+    assert r.frame.limit == 2
+    assert r.frame.ordering
+    assert r.frame.ordering[0].column == "salary"
+    assert r.frame.ordering[0].direction == "DESC"
+
+
+def test_retrieve_grouped_superlative_does_not_fabricate_group_column():
+    # "top department by total sales" used to have the grouping safety net
+    # grab "total" (an aggregation-function WORD, not a real column) back
+    # out of "total sales" and treat it as the grouping dimension — this
+    # silently ran SQL grouped by a column that doesn't exist. It must not
+    # invent a grouping column; deterministic_sql_builder's own safety net
+    # (tested separately in test_deterministic_sql_builder.py) is what
+    # sends this to the AI Planner instead once group_by is correctly empty.
+    r = run_people("top department by total sales")
+    assert r.status == STATUS_SUCCESS
+    assert "total" not in r.frame.group_by
+    assert len(r.frame.aggregations) == 1
+    assert r.frame.aggregations[0].function == "SUM"
+    assert r.frame.aggregations[0].column == "sales"
+
+
+def test_retrieve_implicit_equality_with_no_operator_word():
+    # "with status active" has no "="/"is"/"are" between the column and the
+    # value — this used to match nothing at all and silently ran an
+    # unfiltered SELECT *.
+    r = run_people("people with status active")
+    assert r.status == STATUS_SUCCESS
+    filters = [f for f in r.frame.filters if f.column == "status"]
+    assert filters and filters[0].operator == "=" and filters[0].value == "active"
+
+
+def test_retrieve_implicit_equality_does_not_fabricate_from_descriptive_phrase():
+    # "high" is not a real column — must NOT invent a filter col="high"
+    # val="salary" just because it has the same "with <word> <word>" shape
+    # as a real implicit-equality filter.
+    r = run_people("people with high salary")
+    assert r.status == STATUS_SUCCESS
+    assert r.frame.filters == []
+
+
+def test_retrieve_implicit_equality_does_not_collide_with_comparative_filter():
+    # "with salary greater than 50000" must produce ONLY the real
+    # comparative filter — the implicit-equality fallback used to also
+    # match "salary greater" as if "greater" were a literal value,
+    # producing a bogus second filter alongside the correct one.
+    r = run_people("people with salary greater than 50000")
+    assert r.status == STATUS_SUCCESS
+    assert len(r.frame.filters) == 1
+    assert r.frame.filters[0].column == "salary"
+    assert r.frame.filters[0].operator == ">"
+    assert r.frame.filters[0].value == "50000"
+
+
+def test_retrieve_between_filter():
+    # "between X and Y" was not recognized at all — silently ran an
+    # unfiltered SELECT * instead of the two-sided range the user asked for.
+    r = run_people("people with salary between 40000 and 80000")
+    assert r.status == STATUS_SUCCESS
+    filters = {(f.column, f.operator, f.value) for f in r.frame.filters}
+    assert ("salary", ">=", "40000") in filters
+    assert ("salary", "<=", "80000") in filters
+
+
+def test_retrieve_where_clause_chained_with_and():
+    # "where A = B and C = D" — only the FIRST "where"-anchored clause was
+    # ever extracted; every clause chained after it with "and" (which has
+    # no "where" of its own) was silently dropped.
+    r = run_people("show people where salary > 50000 and age > 30")
+    filters = {(f.column, f.operator, f.value) for f in r.frame.filters}
+    assert ("salary", ">", "50000") in filters
+    assert ("age", ">", "30") in filters
+
+
+def test_retrieve_with_equals_chained_with_and():
+    # Same gap as above, for "with A = B and C = D" phrasing.
+    r = run_people("people with department = sales and status = active")
+    filters = {(f.column, f.operator, f.value) for f in r.frame.filters}
+    assert ("department", "=", "sales") in filters
+    assert ("status", "=", "active") in filters
+
+
+def test_retrieve_two_different_comparative_constructs():
+    # "at least" and "at most" are two DIFFERENT _COMPARATIVE_OPS pattern
+    # types — the old code returned as soon as the FIRST pattern type
+    # matched anywhere in the message, so the second construct (a
+    # completely different column) was silently dropped even though
+    # nothing about it was actually ambiguous.
+    r = run_people("people with salary at least 50000 and age at most 60")
+    filters = {(f.column, f.operator, f.value) for f in r.frame.filters}
+    assert ("salary", ">=", "50000") in filters
+    assert ("age", "<=", "60") in filters
 
 
 # ─── Knowledge (conceptual SQL/DB questions) ─────────────────────────────────

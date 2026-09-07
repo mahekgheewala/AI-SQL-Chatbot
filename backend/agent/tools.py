@@ -387,6 +387,35 @@ def _build_context(session: dict, target_db: Optional[str], target_table: Option
 # Tool 1 — execute_sql
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _sql_matches_expected_aggregations(sql: str, aggregations: list) -> tuple[bool, str]:
+    """Lightweight structural check — not a SQL parser, just confirms each
+    expected aggregation function is actually applied to its expected
+    column somewhere in the generated SQL. Catches the class of bug where
+    the LLM produces safe, schema-valid, syntactically correct SQL that
+    nonetheless answers a materially different question than what was
+    asked (e.g. COUNT(*) returned for a "total revenue" request instead of
+    SUM(revenue)) — SQL that would sail through the existing safety/schema/
+    DDL gates untouched, since none of them check this."""
+    if not aggregations:
+        return True, ""
+    for agg in aggregations:
+        fn = str(getattr(agg, "function", "") or "").upper()
+        col = str(getattr(agg, "column", "") or "")
+        if not fn or not col:
+            continue
+        pattern = re.compile(
+            rf"{re.escape(fn)}\s*\(\s*(?:DISTINCT\s+)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?{re.escape(col)}\b",
+            re.IGNORECASE,
+        )
+        if not pattern.search(sql):
+            return False, (
+                f"Expected the query to compute {fn}({col}) based on the request, "
+                f"but the generated SQL doesn't apply {fn} to {col} — it may answer "
+                f"a different question than the one asked."
+            )
+    return True, ""
+
+
 def execute_sql(
     instruction: str,
     target_db: Optional[str],
@@ -396,10 +425,16 @@ def execute_sql(
     execution_context: Optional[ExecutionContext] = None,
     planning_doc: Optional[dict] = None,
     pipeline_hint: Optional[str] = None,
+    expected_aggregations: Optional[list] = None,
 ) -> dict:
     """
     Thin wrapper around the existing SQL generation + validation + execution
     pipeline (Phases 3 → 5).
+
+    expected_aggregations: optional list of QueryAggregation the Gateway's
+    own grounded frame already identified (see agent_coordinator.py's
+    "execute_sql" dispatch) — when present, the generated SQL is checked
+    against it (see _sql_matches_expected_aggregations) before execution.
 
     Returns a dict with keys:
         intent, sql, question, execution_database,
@@ -597,6 +632,16 @@ def execute_sql(
     # ── Phase 4: Validate ─────────────────────────────────────────────────────
     raw_schema = meta.get("schema", {})
     validation = validate_sql(intent, sql, raw_schema)
+
+    # Issue 7: intent-match check, folded into the same validation dict so
+    # it's caught by the existing "stop if invalid" guard below exactly
+    # like the safety/schema/DDL gates already are — no separate code path
+    # to keep in sync.
+    if validation["valid"] and not validation["requires_confirmation"] and expected_aggregations:
+        matches, mismatch_reason = _sql_matches_expected_aggregations(sql, expected_aggregations)
+        if not matches:
+            validation["valid"] = False
+            validation["failure_reason"] = mismatch_reason
 
     result["valid"]                = validation["valid"]
     result["risk_level"]           = validation["risk_level"]

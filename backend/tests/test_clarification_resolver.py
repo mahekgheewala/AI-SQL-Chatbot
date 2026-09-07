@@ -57,7 +57,7 @@ class TestResolveCreateTableSlots(unittest.TestCase):
             '{"table_name": "books", "columns": '
             '[{"name": "id", "type": "INTEGER"}, {"name": "name", "type": "TEXT"}], '
             '"confidence": 0.95}',
-            0.1,
+            0.1, {}
         )
         result = resolve_create_table_slots(
             original_request="create a table in it",
@@ -79,7 +79,7 @@ class TestResolveCreateTableSlots(unittest.TestCase):
     def test_invalid_column_name_fails_closed(self, mock_groq):
         mock_groq.return_value = (
             '{"table_name": "books", "columns": [{"name": "select", "type": "TEXT"}], "confidence": 0.9}',
-            0.1,
+            0.1, {}
         )
         result = resolve_create_table_slots(
             original_request="create a table", missing=["table", "columns"],
@@ -92,7 +92,7 @@ class TestResolveCreateTableSlots(unittest.TestCase):
     def test_invalid_column_type_fails_closed(self, mock_groq):
         mock_groq.return_value = (
             '{"table_name": "books", "columns": [{"name": "id", "type": "NOT_A_REAL_TYPE"}], "confidence": 0.9}',
-            0.1,
+            0.1, {}
         )
         result = resolve_create_table_slots(
             original_request="create a table", missing=["table", "columns"],
@@ -128,7 +128,7 @@ class TestResolveCreateTableSlots(unittest.TestCase):
 
     @patch("agent.local_planner._call_groq_planner")
     def test_malformed_json_fails_closed(self, mock_groq):
-        mock_groq.return_value = ("this is not json at all", 0.1)
+        mock_groq.return_value = ("this is not json at all", 0.1, {})
         result = resolve_create_table_slots(
             original_request="create a table", missing=["table"],
             user_reply="books", metadata=_metadata(),
@@ -145,7 +145,7 @@ class TestResolveSampleDataRequest(unittest.TestCase):
             '{"id": 1, "name": "O\'Brien", "salary": 90000}, '
             '{"id": 2, "name": "Alice", "salary": 85000}'
             '], "confidence": 0.9}',
-            0.1,
+            0.1, {}
         )
         result = resolve_sample_data_request(
             original_request="add sample data", user_reply="employees",
@@ -162,7 +162,7 @@ class TestResolveSampleDataRequest(unittest.TestCase):
     def test_invented_column_fails_closed(self, mock_groq):
         mock_groq.return_value = (
             '{"table": "employees", "rows": [{"id": 1, "not_a_real_column": "x"}], "confidence": 0.9}',
-            0.1,
+            0.1, {}
         )
         result = resolve_sample_data_request(
             original_request="add sample data", user_reply="employees",
@@ -187,7 +187,7 @@ class TestResolveSampleDataRequest(unittest.TestCase):
 
     @patch("agent.local_planner._call_groq_planner")
     def test_no_rows_returned_fails_closed(self, mock_groq):
-        mock_groq.return_value = ('{"table": "employees", "rows": [], "confidence": 0.5}', 0.1)
+        mock_groq.return_value = ('{"table": "employees", "rows": [], "confidence": 0.5}', 0.1, {})
         result = resolve_sample_data_request(
             original_request="add sample data", user_reply="employees",
             metadata=_metadata(), table_hint="employees",
@@ -204,7 +204,7 @@ class TestResolveSampleDataRequest(unittest.TestCase):
             '{"id": "B001", "name": "Alice", "salary": 90000}, '
             '{"id": "B001", "name": "Bob", "salary": 85000}'
             '], "confidence": 0.9}',
-            0.1,
+            0.1, {}
         )
         result = resolve_sample_data_request(
             original_request="add sample data", user_reply="employees",
@@ -223,7 +223,7 @@ class TestResolveSampleDataRequest(unittest.TestCase):
         )
         mock_groq.return_value = (
             '{"table": "employees", "rows": [{"id": "B001", "name": "Carl", "salary": 70000}], "confidence": 0.9}',
-            0.1,
+            0.1, {}
         )
         result = resolve_sample_data_request(
             original_request="add sample data", user_reply="employees",
@@ -263,7 +263,7 @@ class TestResolveChartSlots(unittest.TestCase):
         mock_groq.return_value = (
             '{"table": "employees", "chart_type": "pie", "measure": "salary", '
             '"dimension": "name", "aggregation": null, "confidence": 0.9}',
-            0.1,
+            0.1, {}
         )
         result = resolve_chart_slots(
             original_request="show a pie chart for this table",
@@ -282,7 +282,7 @@ class TestResolveChartSlots(unittest.TestCase):
         mock_groq.return_value = (
             '{"table": "employees", "chart_type": "pie", "measure": null, '
             '"dimension": "name", "aggregation": null, "confidence": 0.4}',
-            0.1,
+            0.1, {}
         )
         result = resolve_chart_slots(
             original_request="show a chart", user_reply="hmm not sure",
@@ -295,7 +295,7 @@ class TestResolveChartSlots(unittest.TestCase):
         mock_groq.return_value = (
             '{"table": "employees", "chart_type": "bar", "measure": "not_a_real_column", '
             '"dimension": null, "aggregation": null, "confidence": 0.5}',
-            0.1,
+            0.1, {}
         )
         result = resolve_chart_slots(
             original_request="show a chart", user_reply="not_a_real_column",

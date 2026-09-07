@@ -229,6 +229,7 @@ class _FakePgConn:
         self.info = _FakeInfo(dbname)
         self.status = psycopg2.extensions.TRANSACTION_STATUS_IDLE
         self.autocommit = False
+        self.readonly = False
 
     def cursor(self):
         return _FakeCursor()
@@ -238,6 +239,13 @@ class _FakePgConn:
 
     def close(self):
         pass
+
+    def set_session(self, readonly=None, **kwargs):
+        # Mirrors real psycopg2.connection.set_session's readonly kwarg —
+        # ConnectionManager.get_connection() (Issue 1's database-level
+        # read-only backstop) calls this on every checkout.
+        if readonly is not None:
+            self.readonly = readonly
 
 
 class _FakeConnModel:

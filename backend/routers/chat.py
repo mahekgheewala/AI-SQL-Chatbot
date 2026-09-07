@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import asyncio
 from typing import Optional, Any
 from fastapi import APIRouter, HTTPException, Depends
 from models.schemas import ChatRequest, ChatResponse, ExecuteConfirmedRequest
@@ -378,6 +379,19 @@ def _resolve_chat_session(user_id: int, session_id: Optional[str]) -> str:
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_current_user)):
+    """Thin async wrapper — the actual work is entirely synchronous
+    (psycopg2 DB calls, Groq/Gemini HTTP calls, and gemini_retry.py's
+    blocking time.sleep() backoff), so it's offloaded to FastAPI's worker
+    thread pool via asyncio.to_thread() instead of running directly on the
+    event loop. Without this, one slow request (a stuck query, an LLM
+    rate-limit retry sleeping for several seconds) would block every other
+    concurrent user's request too, since `async def` alone does not make
+    synchronous code non-blocking — see _chat_endpoint_impl for the actual
+    logic, unchanged from before."""
+    return await asyncio.to_thread(_chat_endpoint_impl, request, current_user)
+
+
+def _chat_endpoint_impl(request: ChatRequest, current_user: Any):
     from state.metadata_store import get_cache_generation
 
     # Phase 9.5: Enforce server-side session ownership before any work happens.
@@ -467,6 +481,21 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
         confidence = decision.understanding.confidence
         target_db = decision.target_db
         database_name_var.set(target_db)
+
+        # After a pending clarification is resolved, decide() re-classifies
+        # the RECONSTRUCTED text (original request + every reply appended
+        # so far — see universal_gateway.py's "append reply, re-understand"
+        # pattern and semantic_frame.frame_result_to_understanding()), and
+        # that accumulated text lands in understanding.normalized_input.
+        # Handlers were always given _cleaned_message instead — just this
+        # turn's own reply in isolation — so a resolved multi-turn
+        # clarification lost everything except the final reply by the time
+        # it reached the Local Planner (e.g. a report clarification
+        # resolved over two replies would hand the Planner only the second
+        # reply, not "generate a report" + both answers). Falls back to
+        # _cleaned_message for the normal (non-clarification) case, where
+        # normalized_input is already the same text anyway.
+        _effective_message = decision.understanding.normalized_input or _cleaned_message
 
         if decision.understanding.source == "DETERMINISTIC":
             gemini_metrics.record_bypass("intent_classifier")
@@ -619,8 +648,30 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
                 except Exception:
                     pass
 
+                # Honest, per-column success message for a resolved
+                # CREATE_TABLE_COLUMNS clarification — lists every column
+                # and flags which ones got a guessed type, instead of a
+                # generic "Execution complete" that hides what was
+                # assumed. See agent/clarification_resolver.py's
+                # resolve_create_table_slots() / _guess_column_type().
+                reply_text = "✅ Execution complete."
+                _cols = clar_data.get("columns")
+                if _cols:
+                    _defaulted = set(clar_data.get("defaulted_columns") or [])
+                    _tbl_match = re.search(r"CREATE TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)", sql, re.IGNORECASE)
+                    _tbl_name = _tbl_match.group(1) if _tbl_match else "the table"
+                    col_descs = [
+                        f"`{c.get('name')}` ({c.get('type')} — no type given, defaulted)"
+                        if c.get("name") in _defaulted
+                        else f"`{c.get('name')}` ({c.get('type')})"
+                        for c in _cols
+                    ]
+                    reply_text = f"✅ Created **{_tbl_name}** with: " + ", ".join(col_descs) + "."
+                    if _defaulted:
+                        reply_text += " Let me know if you'd like different types."
+
                 response = ChatResponse(
-                    reply="✅ Execution complete.",
+                    reply=reply_text,
                     intent="CONFIRMATION",
                     database=exec_db,
                     sql=sql,
@@ -667,7 +718,7 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
             handler = get_handler(intent)
             start_time = time.perf_counter()
             agent_result = handler.handle(
-                message=_cleaned_message,
+                message=_effective_message,
                 metadata=decision.understanding.model_dump(),
                 target_db=None,
                 router_db=None,
@@ -721,7 +772,7 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
         handler = get_handler(intent)
         pipeline_start_time = time.perf_counter()
         agent_result = handler.handle(
-            message=_cleaned_message,
+            message=_effective_message,
             metadata=intent_meta,
             target_db=target_db,
             router_db=target_db,
@@ -731,18 +782,35 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
             decision=decision,
         )
 
+        # Capture the token/call summary BEFORE end_request() resets the
+        # tracker — end_request() commits it to history and clears the
+        # active ContextVar, so anything read after that call sees the
+        # empty default state instead of this request's real usage.
+        _metrics_summary = gemini_metrics.get_active_request_summary()
         gemini_metrics.end_request()
         pipeline_duration_ms = (time.perf_counter() - pipeline_start_time) * 1000
         intent = agent_result.get("intent", "UNKNOWN")
 
-        # Print REQUEST SUMMARY
+        # Print REQUEST SUMMARY — the single place a request's whole journey
+        # (which capability it was understood as, which route it took,
+        # which AI models ran, how many tokens each used) is visible in one
+        # place, rather than pieced together from the separate per-stage
+        # trace blocks (GATEWAY DECISION / AGENT COORDINATOR / etc.) printed
+        # earlier for this same request.
+        _frame_for_summary = getattr(decision, "semantic_frame", None)
+        _capability_id = getattr(_frame_for_summary, "capability_id", None) if _frame_for_summary else None
         print("\n====================================")
         print("REQUEST SUMMARY")
         print("====================================")
+        print(f"Request ID:\n  {_intent_meta.get('request_id', 'unknown')}")
+        print(f"Capability:\n  {_capability_id or 'n/a'}")
         print(f"User Intent:\n  {decision.understanding.intent}")
         print(f"Execution Intent:\n  {intent}")
         print(f"Route:\n  {decision.route}")
         print(f"Execution Time:\n  {pipeline_duration_ms:.2f} ms")
+        print(f"AI Calls This Request:\n  {_metrics_summary.get('calls') or '(none — handled deterministically, no AI call)'}")
+        print(f"Tokens (prompt / response / total):\n  {_metrics_summary.get('prompt_tokens', 0)} / {_metrics_summary.get('response_tokens', 0)} / {_metrics_summary.get('total_tokens', 0)}")
+        print(f"Estimated Cost (USD):\n  {_metrics_summary.get('estimated_cost', 0.0):.6f}")
         print("====================================\n")
 
         # ── Handle newly created Needs Clarification / Confirmation ──────────────
@@ -841,6 +909,18 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
                         visualization_result = viz.model_dump()
                     except Exception as _viz_exc:
                         print(f"[Visualization] Chart generation failed: {_viz_exc}")
+                        # Previously left visualization_result as None here,
+                        # which the frontend can't distinguish from "no
+                        # chart was requested" — the user just silently got
+                        # a plain table with zero indication a chart was
+                        # supposed to be there. status="ERROR" is already a
+                        # documented, handled case in VisualizationResult
+                        # and MessageBubble.jsx; just wasn't being used here.
+                        from visualization.models import VisualizationResult as _VizErrorResult
+                        visualization_result = _VizErrorResult(
+                            status="ERROR",
+                            summary="I got your data, but couldn't build a chart for it.",
+                        ).model_dump()
 
             # Save classification context in session memory
             msg_count = session.get("message_count", 0) + 1
@@ -900,6 +980,12 @@ async def chat_endpoint(request: ChatRequest, current_user: Any = Depends(get_cu
 
 @router.post("/execute-confirmed", response_model=ChatResponse)
 async def execute_confirmed(request: ExecuteConfirmedRequest, current_user: Any = Depends(get_current_user)):
+    """Thin async wrapper — see chat_endpoint's docstring above; same
+    reasoning applies (synchronous DB execution with no async work)."""
+    return await asyncio.to_thread(_execute_confirmed_impl, request, current_user)
+
+
+def _execute_confirmed_impl(request: ExecuteConfirmedRequest, current_user: Any):
     """
     Phase 5: Dual-Validation Execution Route.
     Phase 6: Session memory updated ONLY after successful execution.

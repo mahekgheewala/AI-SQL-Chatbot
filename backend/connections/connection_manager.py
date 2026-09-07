@@ -1,11 +1,12 @@
 import json
+import os
 import time
 import psycopg2
-from threading import Lock, RLock
+from threading import Lock, RLock, BoundedSemaphore
 from sqlalchemy.orm import Session
 from services.connection_service import ConnectionService
 from auth.hashing import decrypt_data
-from utils.config_loader import get_superdb_name
+from utils.config_loader import get_superdb_name, get_db_connect_timeout_seconds, get_db_statement_timeout_ms
 
 # In-memory connection pool: { user_id: {"connection": conn, "last_active": timestamp} }
 _active_connections = {}
@@ -16,6 +17,26 @@ _user_execution_locks: dict[int, RLock] = {}
 _locks_guard = Lock()
 
 IDLE_TIMEOUT_SECONDS = 1800 # 30 minutes
+
+# Bounded ceiling on how many real PostgreSQL connections this one process
+# will ever hold open at once, across ALL users combined — the previous
+# design cached one connection per active user with no upper bound at all,
+# so PostgreSQL's own max_connections could be exhausted purely by having
+# enough distinct users active simultaneously (different users' separate
+# credentials/databases don't change the fact that a single Postgres
+# *server* has one finite connection ceiling). A slot is acquired before a
+# NEW physical connection is opened and released whenever one is closed
+# (idle cleanup, explicit close, or a stale/dropped connection being
+# discarded before its replacement is created) — reusing an
+# already-cached connection needs no slot, since it doesn't open a new one.
+# NOTE (multi-worker deployments): this cap is per-process. Running N
+# uvicorn/gunicorn workers means a true ceiling of roughly
+# N * DB_POOL_MAX_CONNECTIONS real connections, since each worker holds
+# its own independent semaphore — there is no cross-process coordination
+# here. Size DB_POOL_MAX_CONNECTIONS with that multiplication in mind.
+_MAX_TOTAL_CONNECTIONS = int(os.getenv("DB_POOL_MAX_CONNECTIONS", "50"))
+_CONNECTION_ACQUIRE_TIMEOUT_SECONDS = int(os.getenv("DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "10"))
+_connection_slots = BoundedSemaphore(_MAX_TOTAL_CONNECTIONS)
 
 def _load_allowed_databases(conn_model) -> set:
     """
@@ -87,7 +108,7 @@ class ConnectionManager:
             return _user_execution_locks[user_id]
 
     @classmethod
-    def get_connection(cls, user_id: int, db: Session, target_database: str = None, is_autocommit: bool = False) -> psycopg2.extensions.connection:
+    def get_connection(cls, user_id: int, db: Session, target_database: str = None, is_autocommit: bool = False, read_only: bool = False) -> psycopg2.extensions.connection:
         """
         Get or create a connection for the given user.
         If target_database is specified and different from the cached connection,
@@ -98,6 +119,18 @@ class ConnectionManager:
         per-user database ACL (allowed_databases). The maintenance/superdb
         database (DB_SUPERDB) is always reachable so CREATE/DROP DATABASE and
         other superuser operations keep working.
+
+        read_only: when True, the connection's session is put into
+        PostgreSQL's own read-only transaction mode (psycopg2's
+        set_session(readonly=True) — equivalent to
+        SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY) before it's
+        handed back. This is a database-enforced backstop, independent of
+        anything the application's own SQL-safety checks decided: even if
+        a write statement somehow reaches this connection while read_only
+        is requested, PostgreSQL itself rejects it — it does not depend on
+        the app's classification being correct. Callers needing to write
+        (INSERT/UPDATE/DELETE/DDL) must explicitly pass read_only=False
+        (the default), same as they do today.
         """
         cls._cleanup_idle_connections()
 
@@ -133,6 +166,7 @@ class ConnectionManager:
                         except Exception:
                             pass
                         del _active_connections[user_id]
+                        _connection_slots.release()
                     else:
                         # Reset transaction block if open and set autocommit state before health check
                         if conn.status != psycopg2.extensions.TRANSACTION_STATUS_IDLE or conn.autocommit != is_autocommit:
@@ -142,6 +176,16 @@ class ConnectionManager:
                             except Exception:
                                 pass
                             conn.autocommit = is_autocommit
+
+                        # This same cached connection is reused across both
+                        # read and write calls for a user, interleaved, so
+                        # the read-only flag has to be re-asserted (or
+                        # lifted) on every checkout rather than set once.
+                        # set_session() requires an idle connection, which
+                        # the block above already guarantees.
+                        if conn_info.get("readonly") != read_only:
+                            conn.set_session(readonly=read_only)
+                            conn_info["readonly"] = read_only
 
                         # Test connection validity
                         with conn.cursor() as cur:
@@ -163,26 +207,61 @@ class ConnectionManager:
                         conn.close()
                     except:
                         pass
+                    _connection_slots.release()
 
-            # Create a new connection
-            password = decrypt_data(conn_model.encrypted_password) if conn_model.encrypted_password else ""
-            if not password and conn_model.remember_password:
-                raise ValueError("Password is required but missing.")
+            # Create a new connection — bounded: wait up to the acquisition
+            # timeout for a free slot rather than opening an unlimited
+            # number of real PostgreSQL connections. On timeout, fail
+            # gracefully with a clear error instead of either hanging or
+            # silently exceeding the cap.
+            if not _connection_slots.acquire(timeout=_CONNECTION_ACQUIRE_TIMEOUT_SECONDS):
+                raise ValueError(
+                    f"Too many active database connections right now "
+                    f"(limit: {_MAX_TOTAL_CONNECTIONS}). Please try again shortly."
+                )
 
-            conn = psycopg2.connect(
-                host=conn_model.host,
-                port=conn_model.port,
-                user=conn_model.username,
-                password=password,
-                dbname=db_to_use
-            )
+            # From here on, a slot has been acquired — any failure before
+            # the connection is safely cached must release it back, or a
+            # single failed connection attempt would permanently shrink
+            # the pool's effective capacity.
+            try:
+                password = decrypt_data(conn_model.encrypted_password) if conn_model.encrypted_password else ""
+                if not password and conn_model.remember_password:
+                    raise ValueError("Password is required but missing.")
 
-            if is_autocommit:
-                conn.autocommit = True
+                # connect_timeout bounds how long establishing the
+                # connection itself may take (network-level).
+                # statement_timeout is passed via `options` so PostgreSQL
+                # enforces it as a session GUC on every statement executed
+                # on this connection from here on — the correct
+                # server-side mechanism, not a Python-side timer that
+                # can't actually stop a query already running on the
+                # server. Set once at connect time; persists for the
+                # connection's whole cached lifetime (unlike read_only
+                # above, this doesn't vary per checkout, so no need to
+                # reassert it on reuse).
+                conn = psycopg2.connect(
+                    host=conn_model.host,
+                    port=conn_model.port,
+                    user=conn_model.username,
+                    password=password,
+                    dbname=db_to_use,
+                    connect_timeout=get_db_connect_timeout_seconds(),
+                    options=f"-c statement_timeout={get_db_statement_timeout_ms()}",
+                )
+
+                if is_autocommit:
+                    conn.autocommit = True
+
+                conn.set_session(readonly=read_only)
+            except Exception:
+                _connection_slots.release()
+                raise
 
             _active_connections[user_id] = {
                 "connection": conn,
-                "last_active": time.time()
+                "last_active": time.time(),
+                "readonly": read_only,
             }
 
             return conn
@@ -197,6 +276,7 @@ class ConnectionManager:
                 except:
                     pass
                 del _active_connections[user_id]
+                _connection_slots.release()
         with _locks_guard:
             _user_execution_locks.pop(user_id, None)
 
@@ -209,7 +289,7 @@ class ConnectionManager:
             for user_id, info in _active_connections.items():
                 if current_time - info["last_active"] > IDLE_TIMEOUT_SECONDS:
                     stale_users.append(user_id)
-            
+
             for user_id in stale_users:
                 conn = _active_connections[user_id]["connection"]
                 try:
@@ -217,6 +297,7 @@ class ConnectionManager:
                 except:
                     pass
                 del _active_connections[user_id]
+                _connection_slots.release()
 
         if stale_users:
             with _locks_guard:

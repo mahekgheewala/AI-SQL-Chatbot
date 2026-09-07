@@ -50,6 +50,7 @@ import urllib.request
 import urllib.error
 from typing import Optional
 from utils.logging_config import request_id_var
+from agent import gemini_metrics
 
 logger = logging.getLogger("app.ai.local_planner")
 _PREFIX = "[LOCAL_PLANNER]"
@@ -178,20 +179,27 @@ Determine which parts of the codebase are relevant to this request.
   - Only relevant for Codebase Planning mode.
   - For all other modes, set repository_context = null.
 
-Repository modules available in this project:
-  - backend/agent/agent_coordinator.py  (orchestration loop)
-  - backend/agent/tools.py              (tool registry and tool functions)
-  - backend/agent/classification_layer.py (intent classification)
-  - backend/agent/sql_detector.py       (raw SQL detection)
-  - backend/agent/ddl_parser.py         (DDL statement parser)
-  - backend/agent/typo_intent_layer.py  (Typo & Intent preprocessing)
-  - backend/agent/local_planner.py      (Local Planner — this module)
-  - backend/agent/pipeline_registry.py  (pipeline configuration)
-  - backend/db/executor.py              (database executor)
-  - backend/routers/chat.py             (FastAPI chat router)
-  - backend/state/metadata_store.py     (metadata cache)
-  - backend/validation/sql_validator.py (SQL validation)
-  - backend/monitoring/metrics_store.py (metrics collection)
+Repository modules available in this project (kept in sync with the
+actual backend/ folder — do not assume a module exists beyond this list):
+  - backend/agent/universal_gateway.py     (mandatory understanding + routing entry point)
+  - backend/agent/semantic_frame.py        (NL understanding — builds the SemanticFrame)
+  - backend/agent/agent_coordinator.py     (orchestration loop — tool dispatch)
+  - backend/agent/tools.py                 (tool registry and tool functions)
+  - backend/agent/deterministic_sql_builder.py (no-AI SQL construction for simple requests)
+  - backend/agent/local_planner.py         (Local Planner — this module)
+  - backend/agent/clarification_resolver.py (LLM-backed clarification-reply resolution)
+  - backend/agent/pending_resolution.py    (pending clarification tracking/resolution)
+  - backend/agent/handlers.py              (intent -> handler dispatch registry)
+  - backend/agent/sql_detector.py          (raw SQL detection)
+  - backend/agent/ddl_parser.py            (DDL statement parser)
+  - backend/agent/typo_intent_layer.py     (Typo & Intent preprocessing)
+  - backend/db/executor.py                 (database executor)
+  - backend/routers/chat.py                (FastAPI chat router)
+  - backend/state/metadata_store.py        (metadata cache)
+  - backend/validation/safety_checker.py   (SQL safety/risk validation gate)
+  - backend/validation/schema_checker.py   (SQL schema validation gate)
+  - backend/visualization/engine.py        (chart generation)
+  - backend/monitoring/metrics_store.py    (metrics collection)
 
 ---
 STAGE 2: DATABASE CONTEXT ANALYSIS
@@ -241,6 +249,7 @@ Set clarification_required = true AND provide a clarification_question ONLY in t
   3. Missing table: The requested table does not exist in any available schema (does NOT apply when user is explicitly requesting to create a new database or new table via CREATE statements).
   4. Ambiguous table name: The same table name exists in multiple databases and it is unclear which to use.
   5. Destructive operation (DROP TABLE / DROP DATABASE) requested without prior confirmation state.
+  6. Materially ambiguous metric/dimension/timeframe: the request has multiple reasonable, MATERIALLY DIFFERENT interpretations that would change which rows or columns the answer is based on (e.g. "top customers" — by total revenue? order count? average order value? "recent orders" — last day, week, month?). Ask which one is meant rather than silently picking one. This does NOT apply to minor phrasing choices that don't change the actual result (e.g. "customers" vs "clients" when only one table exists) — only when the choice would materially change the data returned.
 
 FOREIGN-KEY JOIN GROUNDING & SINGLE-TABLE PREFERENCE:
 - Multi-table JOIN operations may ONLY be planned if a verified Foreign Key relationship exists between those tables in ACTIVE DATABASE FOREIGN KEYS below.
@@ -371,10 +380,12 @@ USER MESSAGE:
 # Groq API Call
 # ---------------------------------------------------------------------------
 
-def _call_groq_planner(prompt: str) -> tuple[str, float]:
+def _call_groq_planner(prompt: str) -> tuple[str, float, dict]:
     """
     POST request to Groq API chat completions endpoint.
-    Returns (response_text, elapsed_seconds).
+    Returns (response_text, elapsed_seconds, usage) where usage is
+    {"prompt_tokens": int, "completion_tokens": int} (0s if the API
+    response didn't include a usage block).
     """
     api_key = os.getenv("GROQ_API_KEY", _GROQ_API_KEY)
     if not api_key:
@@ -425,33 +436,43 @@ def _call_groq_planner(prompt: str) -> tuple[str, float]:
         response_text = message.get("content", "")
     else:
         response_text = ""
-    return response_text, elapsed
+
+    usage_raw = data.get("usage") or {}
+    usage = {
+        "prompt_tokens": int(usage_raw.get("prompt_tokens") or 0),
+        "completion_tokens": int(usage_raw.get("completion_tokens") or 0),
+    }
+    return response_text, elapsed, usage
 
 
 # ---------------------------------------------------------------------------
 # Response Parser
 # ---------------------------------------------------------------------------
 
-def _parse_planner_response(raw_response: str) -> dict:
+def extract_json_object(raw_response: str) -> dict:
     """
-    Extract and validate the JSON planning document from the model's raw output.
+    Extract a JSON object from a raw LLM response, tolerating the ways
+    models commonly wrap or mangle it.
 
     Handles:
-      - Qwen 3 <think>...</think> reasoning blocks
+      - <think>...</think> reasoning blocks some models emit
       - Markdown code fences (```json ... ```)
-      - Bare JSON objects within surrounding text
+      - Bare JSON objects within surrounding commentary text
+      - JSON truncated before its final closing brace (auto-repair retry)
 
-    Enforces:
-      - Required schema wrapper keys
-      - Required planning_document keys
-      - Valid planning_mode value (Refinement 3: invalid mode raises, does NOT silently normalize)
-      - Domain separation (null context blocks for non-matching modes)
-      - planner_confidence clamped to [0.0, 1.0] (Refinement 4)
-      - estimated_execution_type normalized to valid value (Refinement 5)
+    Raises ValueError if no JSON object could be extracted/parsed.
+
+    Shared by both AI call sites in this pipeline that expect a JSON
+    response (the Local Planner's own response, parsed below, and the
+    Gemini Executor's response in agent_coordinator.py) — previously only
+    the Local Planner's parsing used this level of care; the Executor used
+    a bare json.loads() with no tolerance for the same kinds of stray
+    output, and would fail outright (generic "internal planning error")
+    on exactly the input shapes this function already knows how to handle.
     """
     text = raw_response.strip()
 
-    # Strip Qwen 3 thinking blocks if present
+    # Strip <think>...</think> reasoning blocks if present
     if "<think>" in text and "</think>" in text:
         think_end = text.find("</think>")
         if think_end != -1:
@@ -473,19 +494,32 @@ def _parse_planner_response(raw_response: str) -> dict:
 
     json_str = text[start:end]
     try:
-        wrapper = json.loads(json_str)
+        return json.loads(json_str)
     except json.JSONDecodeError:
         # Retry with auto-appended closing braces if LLM output was truncated before final brace
         fixed_str = json_str
         for _ in range(3):
             fixed_str += "}"
             try:
-                wrapper = json.loads(fixed_str)
-                break
+                return json.loads(fixed_str)
             except json.JSONDecodeError:
                 continue
-        else:
-            raise
+        raise
+
+
+def _parse_planner_response(raw_response: str) -> dict:
+    """
+    Extract and validate the JSON planning document from the model's raw output.
+
+    Enforces (on top of extract_json_object()'s tolerant extraction):
+      - Required schema wrapper keys
+      - Required planning_document keys
+      - Valid planning_mode value (Refinement 3: invalid mode raises, does NOT silently normalize)
+      - Domain separation (null context blocks for non-matching modes)
+      - planner_confidence clamped to [0.0, 1.0] (Refinement 4)
+      - estimated_execution_type normalized to valid value (Refinement 5)
+    """
+    wrapper = extract_json_object(raw_response)
 
     # Validate top-level wrapper keys
     if "schema_version" not in wrapper or "planning_document" not in wrapper:
@@ -642,8 +676,15 @@ def plan(
     try:
         # Check session-level cache before calling Groq API.
         prompt = _build_planner_prompt(user_message, intent_meta, schema_context, history)
-        raw_response, _elapsed = _call_groq_planner(prompt)
+        raw_response, _elapsed, usage = _call_groq_planner(prompt)
         total_time_ms = (time.perf_counter() - start_time) * 1000
+
+        gemini_metrics.record_call("local_planner")
+        gemini_metrics.record_tokens(
+            "local_planner",
+            usage["prompt_tokens"],
+            usage["completion_tokens"],
+        )
 
         wrapper = _parse_planner_response(raw_response)
 

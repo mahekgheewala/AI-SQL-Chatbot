@@ -54,7 +54,7 @@ ACTION_WORDS = {
     "switch", "use", "connect", "show", "display", "list", "describe", "explain",
     "plot", "chart", "graph", "visualize",
     "drop", "delete", "remove", "destroy",
-    "give", "tell", "get", "see", "select", "filter", "group", "count",
+    "give", "tell", "get", "see", "select", "filter", "group", "count", "find",
 }
 
 # Value-assignment language ("give Alice a raise", "give it a discount") that
@@ -142,8 +142,18 @@ _COMPARATIVE_OPS = [
     (re.compile(r"\bat\s+least\b|\bgreater\s+than\s+or\s+equal\s+to\b|>=", re.IGNORECASE), ">=", None),
     (re.compile(r"\bat\s+most\b|\bless\s+than\s+or\s+equal\s+to\b|<=", re.IGNORECASE), "<=", None),
     (re.compile(r"\bis\s+not\b|!=|<>", re.IGNORECASE), "!=", None),
-    (re.compile(r"\bolder\s+than\b", re.IGNORECASE), ">", "older"),
-    (re.compile(r"\byounger\s+than\b", re.IGNORECASE), "<", "younger"),
+    # "older"/"younger" unambiguously mean age in every schema this
+    # assistant deals with — unlike "higher"/"lower" below (could mean
+    # salary, price, score, rating; genuinely ambiguous, correctly left as
+    # the literal word so resolve_attribute_word's failure asks for
+    # clarification), there's no real question to ask here. The implicit
+    # word used to be the literal adjective itself ("older"), which was
+    # then handed to resolve_attribute_word() as if it were a candidate
+    # column name — "older" doesn't fuzzy-match any real "age" column, so
+    # this always failed and incorrectly reported the request as ambiguous
+    # even though the intended column was never actually in question.
+    (re.compile(r"\bolder\s+than\b", re.IGNORECASE), ">", "age"),
+    (re.compile(r"\byounger\s+than\b", re.IGNORECASE), "<", "age"),
     (re.compile(r"\bhigher\s+than\b", re.IGNORECASE), ">", "higher"),
     (re.compile(r"\blower\s+than\b", re.IGNORECASE), "<", "lower"),
     (re.compile(r"\bgreater\s+than\b|\bmore\s+than\b|\babove\b|\bover\b|\bexceeds\b", re.IGNORECASE), ">", None),
@@ -252,6 +262,18 @@ def _resolve_action(word: str, idx: int, lead: List[str], tokens: List[str],
             return ("add", "DATA")
         if any(r in tokens for r in ("row", "rows", "record", "records")):
             return ("add", "DATA")
+        if word == "add" and "more" in tokens:
+            # "add 5 more" / "add more" as a bare follow-up after a prior
+            # "add sample data to X" turn — this app has no other capability
+            # "add more" could sensibly mean (no generic "add a row of
+            # literal data", nothing "more" applies to for table/column/
+            # database creation), so "more" alone is already an
+            # unambiguous signal, without needing session context here.
+            # Previously unrecognized entirely, this fell through to
+            # capability_id="understanding_failed" and lost the table
+            # context a genuine add_sample_data frame would have carried
+            # forward via context_table_hint.
+            return ("add", "DATA")
         if "column" in tokens or "columns" in tokens:
             return ("alter", "COLUMN")
         if "table" in tokens:
@@ -279,6 +301,23 @@ def _resolve_action(word: str, idx: int, lead: List[str], tokens: List[str],
             return ("alter", "COLUMN")
         return ("rename", "TABLE")
     if word in ("switch", "use", "connect"):
+        if word == "use" and "database" not in tokens and "db" not in tokens:
+            # Bare "use" is genuinely ambiguous outside of a "use X
+            # database"/"use my_db" style sentence — "now use headcount
+            # instead" (a chart follow-up asking for a different measure)
+            # doesn't mean "switch database" at all, but "use" alone used
+            # to always claim it did. "switch"/"connect" are unambiguous
+            # verbs on their own and don't need this narrowing. Only commit
+            # to DATABASE_SWITCH here when the word right after "use" is
+            # actually a real, existing database — otherwise this isn't
+            # confidently a database-switch request, so return None
+            # (unrecognized) rather than misroute it as one; the caller
+            # falls through to the AI Planner, which can read the rest of
+            # the conversation instead of guessing from one word alone.
+            after = [t for t in lead[idx + 1:] if G.is_identifier(t) and not G.is_non_entity(t)]
+            candidate = after[0] if after else None
+            if not candidate or G.ground_database(candidate, metadata) is None:
+                return None
         return ("switch", "DATABASE")
     if word in ("show", "display", "list"):
         if _is_chart_request(tokens):
@@ -314,9 +353,12 @@ def _resolve_action(word: str, idx: int, lead: List[str], tokens: List[str],
         return None
     if word == "give" and any(t in _VALUE_CHANGE_WORDS for t in tokens):
         return None
-    if word in ("give", "tell", "get", "see", "select", "filter", "group", "count"):
+    if word in ("give", "tell", "get", "see", "select", "filter", "group", "count", "find"):
         return ("select", "DATA")
     return None
+
+
+_CONSTRAINT_LEAD_WORDS = {"primary", "unique", "not", "null", "references", "default"}
 
 
 def _column_specs(part_tokens: List[str]) -> List[ColumnSpec]:
@@ -327,19 +369,92 @@ def _column_specs(part_tokens: List[str]) -> List[ColumnSpec]:
     for i in range(1, len(part_tokens)):
         if G.is_type_word(part_tokens[i]):
             return [ColumnSpec(name=part_tokens[0], type=" ".join(part_tokens[i:]).upper())]
+    if part_tokens[1] in _CONSTRAINT_LEAD_WORDS:
+        # A bare constraint phrase with no type word at all ("id primary
+        # key", "email not null") is still ONE column, not several. This
+        # used to fall through to the "independent column names" branch
+        # below, which treated "primary"/"key"/"null" etc. as if they were
+        # separate columns the user asked for — fake columns that don't
+        # exist in the actual request. Folding the phrase into `type`
+        # (same place a real type word's trailing constraint text already
+        # lands, just above) reuses the existing _type_allowed() safety
+        # net in capability_check.py: "PRIMARY KEY" isn't a recognized
+        # type, so this correctly asks for clarification instead of
+        # silently fabricating columns.
+        return [ColumnSpec(name=part_tokens[0], type=" ".join(part_tokens[1:]).upper())]
     return [ColumnSpec(name=t) for t in part_tokens]
 
 
 def _split_column_text(text: str) -> List[str]:
-    parts = re.split(r"\s*,\s*|\s+and\s+|\s*&\s*", text.strip())
+    """Split a column-list fragment on commas / "and" / "&", but only at
+    paren depth 0 — a column carrying an inline nested clause (most
+    commonly a foreign key, e.g. "customer_id int references
+    customers(id)") must not get split apart at anything inside that
+    clause. A plain regex split has no notion of nesting and would slice
+    "customers(id)" in half if it ever contained one of these delimiters;
+    depth-tracking avoids that regardless of what the nested clause says."""
+    parts: List[str] = []
+    current: List[str] = []
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+            current.append(ch)
+            i += 1
+        elif ch == ")":
+            depth -= 1
+            current.append(ch)
+            i += 1
+        elif depth == 0 and ch == ",":
+            parts.append("".join(current))
+            current = []
+            i += 1
+        elif depth == 0 and ch == "&":
+            parts.append("".join(current))
+            current = []
+            i += 1
+        elif depth == 0 and text[i:i + 5].lower() == " and ":
+            parts.append("".join(current))
+            current = []
+            i += 5
+        else:
+            current.append(ch)
+            i += 1
+    parts.append("".join(current))
     return [p.strip() for p in parts if p.strip()]
+
+
+def _first_balanced_paren_span(message: str) -> Optional[str]:
+    """Return the text between the first "(" in `message` and its
+    depth-matched closing ")". A naive `\\(([^)]*)\\)` regex stops at the
+    FIRST ")" it sees — for a column list containing an inline nested-paren
+    clause (a "REFERENCES table(col)" foreign key, most commonly), that
+    first ")" belongs to the nested clause, not the outer column list, so
+    the regex silently truncated (or malformed) the capture and dropped
+    every column that came after it. Returns None if there's no closing
+    paren matching the first opening one."""
+    start = message.find("(")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(message)):
+        if message[i] == "(":
+            depth += 1
+        elif message[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return message[start + 1:i]
+    return None
 
 
 def _column_list_from_fragment(tokens: List[str], message: str) -> Optional[List[ColumnSpec]]:
     if "(" in message:
-        m = re.search(r"\(([^)]*)\)", message)
-        if m:
-            parts = _split_column_text(m.group(1))
+        inner = _first_balanced_paren_span(message)
+        if inner is not None:
+            parts = _split_column_text(inner)
             cols = []
             for p in parts:
                 cols.extend(_column_specs(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", p.lower())))
@@ -364,19 +479,53 @@ def _column_list_from_fragment(tokens: List[str], message: str) -> Optional[List
 
 # ─── Role parsers ────────────────────────────────────────────────────────────
 
-def _after_marker(tokens: List[str], markers: Tuple[str, ...]) -> Optional[str]:
+# Words that end a name being built, but are never valid PostgreSQL
+# identifiers to begin with anyway — used to stop multi-word name
+# consumption at a clause boundary ("named sales data warehouse with
+# columns id int" should stop the name at "warehouse", not swallow "with
+# columns id int" too).
+_NAME_CLAUSE_BOUNDARY_WORDS = frozenset({
+    "with", "having", "containing", "using", "and",
+})
+
+
+def _after_marker(tokens: List[str], markers: Tuple[str, ...], allow_multi_word: bool = False) -> Optional[str]:
+    """Find the identifier following a marker word ("named X", "called X").
+
+    By default returns only the single token immediately after the marker
+    — right for existing-table/database lookups, where the real name is
+    always one identifier and over-consuming trailing words risks
+    producing a garbled name that simply fails to ground, rather than a
+    helpful match.
+
+    With allow_multi_word=True (used only where a FRESH name is being
+    defined — CREATE DATABASE / CREATE TABLE), consumes a run of
+    subsequent valid tokens and joins them with underscores, so a natural
+    multi-word name ("named sales data warehouse") produces one valid SQL
+    identifier ("sales_data_warehouse") instead of silently keeping only
+    the first word and discarding the rest.
+    """
     for i, tok in enumerate(tokens):
         if tok in markers:
+            name_parts: List[str] = []
             for j in range(i + 1, len(tokens)):
                 t = tokens[j]
-                if t in LEADING_POLITE or t in ("a", "an", "the", "new", "fresh"):
+                if not name_parts and (t in LEADING_POLITE or t in ("a", "an", "the", "new", "fresh")):
                     continue
+                if t in _NAME_CLAUSE_BOUNDARY_WORDS:
+                    break
                 if not G.is_identifier(t):
-                    return None
-                if G.is_non_entity(t) or G.is_pronoun(t):
+                    break
+                if G.is_pronoun(t):
+                    if name_parts:
+                        break
                     continue
-                return t
-            return None
+                if not name_parts and G.is_non_entity(t):
+                    continue
+                name_parts.append(t)
+                if not allow_multi_word:
+                    break
+            return "_".join(name_parts) if name_parts else None
     return None
 
 
@@ -394,10 +543,10 @@ def _before_marker(tokens: List[str], markers: Tuple[str, ...]) -> Optional[str]
 
 def _parse_create_database(tokens: List[str], message: str) -> Optional[str]:
     if "called" in tokens or "named" in tokens:
-        name = _after_marker(tokens, ("called", "named"))
+        name = _after_marker(tokens, ("called", "named"), allow_multi_word=True)
         if name:
             return name
-    return _after_marker(tokens, ("database", "db"))
+    return _after_marker(tokens, ("database", "db"), allow_multi_word=True)
 
 
 def _parse_create_table(tokens: List[str], message: str) -> Tuple[Optional[str], List[ColumnSpec]]:
@@ -408,30 +557,32 @@ def _parse_create_table(tokens: List[str], message: str) -> Tuple[Optional[str],
         cols = _column_list_from_fragment(tokens, message) or []
         before = message.split("(")[0].strip()
         before_tokens = _tokens(before)
-        table_name = _after_marker(before_tokens, ("called", "named", "table"))
+        table_name = _after_marker(before_tokens, ("called", "named", "table"), allow_multi_word=True)
         if not table_name:
             table_name = _before_marker(before_tokens, ("table",))
     else:
         m = re.search(r"\bwith\s+(?:columns\s+)?(.+)$", message.lower())
         has_with_clause = bool(m) and bool(_tokens(m.group(1)))
-        name = _after_marker(tokens, ("called", "named"))
+        name = _after_marker(tokens, ("called", "named"), allow_multi_word=True)
         if not name:
-            name = _after_marker(tokens, ("table",))
+            name = _after_marker(tokens, ("table",), allow_multi_word=True)
         if not name:
             name = _before_marker(tokens, ("table",))
         if has_with_clause:
             cols = _column_list_from_fragment(tokens, message) or []
-            with_idx = next((i for i, t in enumerate(tokens) if t == "with"), len(tokens))
-            if name:
-                name_idx = next((i for i, t in enumerate(tokens) if t == name), with_idx)
-                table_name = name if name_idx < with_idx else None
-            else:
-                table_name = None
+            # _after_marker already stops a multi-word name at "with" (it's
+            # in _NAME_CLAUSE_BOUNDARY_WORDS), so `name` here can never
+            # extend into the "with columns ..." clause — no separate
+            # index check needed. (A prior version of this check compared
+            # `name` against individual tokens by equality, which broke
+            # once `name` could be a multi-word, underscore-joined string
+            # that no longer matches any single original token.)
+            table_name = name
         else:
             table_name = name
 
     if not table_name and not cols:
-        table_name = _after_marker(tokens, ("table",)) or _before_marker(tokens, ("table",))
+        table_name = _after_marker(tokens, ("table",), allow_multi_word=True) or _before_marker(tokens, ("table",))
     return table_name, cols
 
 
@@ -455,7 +606,8 @@ def _dedupe_filters(filters: List[Tuple[str, str, str]]) -> List[Tuple[str, str,
     return out
 
 
-def _parse_alter_column(tokens: List[str], message: str) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+def _parse_alter_column(tokens: List[str], message: str,
+                        context_table_hint: Optional[str] = None) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
     table = None
     column = None
     column_type = None
@@ -476,14 +628,49 @@ def _parse_alter_column(tokens: List[str], message: str) -> Tuple[Optional[str],
         table = _after_marker(tokens, ("to", "in", "from"))
         if table and table.lower() in ("table",):
             table = None
+    if not table:
+        # A natural follow-up ("now drop the status column" right after
+        # "describe employees") names no table at all — same gap
+        # _parse_add_sample_data had before it was fixed: falls back to
+        # the previous turn's table instead of forcing a "which table?"
+        # clarification for something the conversation already made clear.
+        table = context_table_hint
 
     for i, tok in enumerate(tokens):
         if tok == "column":
             for j in range(i + 1, len(tokens)):
-                if G.is_identifier(tokens[j]) and not G.is_non_entity(tokens[j]):
-                    column = tokens[j]
+                t = tokens[j]
+                if t in ("from", "to", "in"):
+                    # These introduce the TABLE reference ("drop column
+                    # status FROM employees") — the scan used to just skip
+                    # straight past them looking for the next identifier,
+                    # which meant it could walk right past the boundary and
+                    # grab the table name itself as if it were the column
+                    # ("...from employees" -> column="employees"). Stop
+                    # here instead: nothing found before this word means
+                    # there's no column name in the "column X" position at
+                    # all for this message.
+                    break
+                if G.is_identifier(t) and not G.is_non_entity(t):
+                    column = t
                     if j + 1 < len(tokens) and G.is_type_word(tokens[j + 1]):
                         column_type = _type_from(tokens, j + 1)
+                    break
+            if not column:
+                # "column" with nothing usable after it — try the name
+                # BEFORE it instead. "add column X" puts the name after the
+                # keyword, but "drop the X column" / "remove the X column"
+                # — at least as natural a phrasing, arguably more so for
+                # drop/rename — puts it before. Only the after-case was
+                # handled, so this word order silently found no column at
+                # all despite one being named right there in the sentence.
+                for j in range(i - 1, -1, -1):
+                    t = tokens[j]
+                    if t in ("the", "a", "an"):
+                        continue
+                    if (G.is_identifier(t) and not G.is_non_entity(t)
+                            and t not in ("add", "drop", "delete", "remove", "rename", "table")):
+                        column = t
                     break
             break
 
@@ -505,18 +692,35 @@ def _parse_alter_column(tokens: List[str], message: str) -> Tuple[Optional[str],
     return table, column, column_type, "ADD_COLUMN"
 
 
-def _parse_add_sample_data(tokens: List[str], message: str) -> Tuple[Optional[int], Optional[str]]:
+def _parse_add_sample_data(tokens: List[str], message: str,
+                           context_table_hint: Optional[str] = None) -> Tuple[Optional[int], Optional[str]]:
+    # "rows?|records?" alone missed the capability's own name — "add 10
+    # sample data" has "10" followed by "sample data", not "sample rows"/
+    # "sample records", so the count was never captured at all and this
+    # function silently returned None, which the caller then defaulted to
+    # a hardcoded 5 regardless of what was actually asked for.
+    # "more" is also accepted as the trailing word — a bare follow-up like
+    # "add 10 more" (no "rows"/"records"/etc. at all) previously matched
+    # neither pattern, so the "10" was silently discarded and the caller
+    # defaulted to a hardcoded 5 regardless of what was actually asked for.
     count = None
-    m = re.search(r"\b(\d+)\s*(?:sample\s+)?(?:rows?|records?)\b", message.lower())
+    m = re.search(r"\b(\d+)\s*(?:sample\s+)?(?:rows?|records?|data|entries|items|more)\b", message.lower())
     if m:
         count = int(m.group(1))
     else:
-        m2 = re.search(r"\b([a-z]+)\s*(?:sample\s+)?(?:rows?|records?)\b", message.lower())
+        m2 = re.search(r"\b([a-z]+)\s*(?:sample\s+)?(?:rows?|records?|data|entries|items|more)\b", message.lower())
         if m2:
             count = _worded_number(m2.group(1))
     table = _after_marker(tokens, ("to", "in"))
     if table and table.lower() in ("table",):
         table = None
+    if not table:
+        # A natural follow-up ("add 5 more") names no table at all — unlike
+        # _parse_retrieve/_parse_visualize, this never fell back to the
+        # previous turn's table, so a message immediately after "add
+        # sample data to employees" lost that table entirely and had to be
+        # guessed from scratch by the AI Planner with no grounded context.
+        table = context_table_hint
     return count, table
 
 
@@ -530,12 +734,19 @@ _AGG_WORD_TO_FUNCTION = {
 
 
 def _parse_visualize(tokens: List[str], message: str, metadata: dict,
-                     context_table_hint: Optional[str] = None) -> Tuple[ChartSpec, Optional[str]]:
-    """Parse a chart request and resolve its table. Returns (ChartSpec, table)
-    — table is returned separately (not just via the caller's own loop) since
-    the raw measure/dimension words below must be excluded from table
-    candidacy first (the same "salary" vs "salaries" conflation the retrieve
-    capability guards against — see _filter_reference_words)."""
+                     context_table_hint: Optional[str] = None
+                     ) -> Tuple[ChartSpec, Optional[str], bool]:
+    """Parse a chart request and resolve its table. Returns (ChartSpec, table,
+    unresolved_measure) — table is returned separately (not just via the
+    caller's own loop) since the raw measure/dimension words below must be
+    excluded from table candidacy first (the same "salary" vs "salaries"
+    conflation the retrieve capability guards against — see
+    _filter_reference_words). unresolved_measure is True when the message
+    named a measure word that does NOT ground to any real column — the
+    capability-completeness check upstream only verified a ChartSpec object
+    exists at all, not that its measure actually resolved, so
+    "plot bogus by department" silently built a chart with measure=None
+    instead of asking what to plot; this flag lets the caller ask instead."""
     chart_type = None
     dimension_word = None
     measure_word = None
@@ -586,27 +797,87 @@ def _parse_visualize(tokens: List[str], message: str, metadata: dict,
 
     measure = G.ground_column(measure_word, metadata, table=attr_table) if measure_word else None
     dimension = G.ground_column(dimension_word, metadata, table=attr_table) if dimension_word else None
+    # A measure word that actually names the TABLE ("chart of employees by
+    # department") isn't a failed measure attempt — it's the entity being
+    # counted, the same table-noun-in-the-measure-slot case `exclude`
+    # already accounts for above when matching the table itself. Only a
+    # word that grounds as neither a column NOR a table is genuinely
+    # unresolved.
+    unresolved_measure = (
+        bool(measure_word) and measure is None
+        and G.ground_table(measure_word, metadata, allow_fresh=False) is None
+    )
 
     return ChartSpec(chart_type=chart_type, dimension=dimension, measure=measure,
-                     aggregation=aggregation), table
+                     aggregation=aggregation), table, unresolved_measure
 
 
-def _parse_filters(message: str) -> List[Tuple[str, str, str]]:
+_CHAIN_CLAUSE_RE = re.compile(
+    r"^\s*(?P<col>[a-z_]+)\s*(?P<op>=|!=|>=|<=|>|<|\bis\b|\bare\b)\s*"
+    r"(?P<val>[a-z0-9_.'\s-]+?)\s*(?:and|,|$)"
+)
+
+
+def _consume_chained_clauses(rest: str) -> List[Tuple[str, str, str]]:
+    """Given the text right after an already-matched "<col> op <val>"
+    clause, keep consuming further "and"/","-joined clauses of the same
+    shape. Each clause after the first has no marker word of its own
+    ("where A = B and C = D", "with A = B and C = D") — only the first
+    clause carries "where"/"with"/"having", so a single re.search for the
+    marker-anchored pattern only ever found that one clause."""
+    out: List[Tuple[str, str, str]] = []
+    while True:
+        m = _CHAIN_CLAUSE_RE.match(rest)
+        if not m:
+            break
+        op = m.group("op")
+        if op in ("is", "are"):
+            op = "="
+        out.append((m.group("col"), op, m.group("val").strip()))
+        rest = rest[m.end():]
+    return out
+
+
+def _parse_filters(message: str, table: Optional[str] = None,
+                   metadata: Optional[dict] = None) -> List[Tuple[str, str, str]]:
     text = message.lower()
     filters = []
+
+    # "between X and Y" — a single natural-language construct that maps to
+    # TWO filter clauses (col >= X AND col <= Y), not one. Previously
+    # unhandled entirely: no pattern below matches "between", so a message
+    # like "salary between 40000 and 80000" produced zero filters and
+    # silently ran an unfiltered SELECT * — the "confidently wrong" failure
+    # class this whole pass is about, not just a missing feature.
+    m = re.search(r"\b(?P<col>[a-z_]+)\s+between\s+(?P<lo>\d+)\s+and\s+(?P<hi>\d+)\b", text)
+    if m:
+        filters.append((m.group("col"), ">=", m.group("lo")))
+        filters.append((m.group("col"), "<=", m.group("hi")))
 
     m = re.search(r"\bin\s+(?:the\s+)?(?P<val>[a-z_][a-z0-9_]*)\s+(?P<col>[a-z_]+)\s*$", text)
     if m and not G.is_non_entity(m.group("col")) and not G.is_type_word(m.group("col")):
         filters.append((m.group("col"), "=", m.group("val")))
 
-    m = re.search(r"\b(?P<col>[a-z_]+)\s+(?:is|are|was|were|has|have)\s+(?:been\s+)?(?:greater than|more than|over)\s+(?P<val>\d+)", text)
-    if m:
-        filters.append((m.group("col"), ">", m.group("val")))
-    else:
-        m = re.search(r"\b(?P<col>[a-z_]+)\s+(?:greater than|less than|over|more than|>\s*)\s*(?P<val>\d+)", text)
-        if m:
-            op = "<" if "less than" in text[m.start():m.end()] else ">"
-            filters.append((m.group("col"), op, m.group("val")))
+    # finditer, not search — a message can filter on more than one column
+    # this way ("age over 30 and salary under 100000"); search() only ever
+    # found the first such clause and silently dropped the rest (same class
+    # of bug as the aggregation-detection fix above). Also widened to cover
+    # both directions in one pass ("under"/"below"/"fewer than"/"above"/
+    # "exceeds" alongside the original "over"/"greater than"/"less than"
+    # vocabulary) so a single scan catches a mixed "X over A and Y under B"
+    # sentence instead of needing two separate one-shot patterns.
+    for m in re.finditer(
+        r"\b(?P<col>[a-z_]+)\s+(?:(?:is|are|was|were|has|have)\s+(?:been\s+)?)?"
+        r"(?P<phrase>greater\s+than|less\s+than|more\s+than|fewer\s+than|over|under|above|below|exceeds|>)\s*"
+        r"(?P<val>\d+)",
+        text,
+    ):
+        col = m.group("col")
+        if col in ("is", "are", "was", "were", "has", "have", "been"):
+            continue
+        phrase = m.group("phrase")
+        op = "<" if phrase in ("less than", "fewer than", "under", "below") else ">"
+        filters.append((col, op, m.group("val")))
 
     m = re.search(r"\b(?:hired|joined|after|since)\s+(?:in\s+)?(?P<val>\d{4})\b", text)
     if m:
@@ -615,10 +886,54 @@ def _parse_filters(message: str) -> List[Tuple[str, str, str]]:
     m = re.search(r"\bwhere\s+(?P<col>[a-z_]+)\s*(?P<op>=|!=|>|<|>=|<=)\s*(?P<val>[a-z0-9_.'\s-]+?)\s*(?:and|,|$)", text)
     if m:
         filters.append((m.group("col"), m.group("op"), m.group("val").strip()))
+        # "where A = B and C = D [and ...]" — every clause after the first
+        # is a bare "<col> op <val>" with no "where" of its own. A single
+        # re.search here only ever found the FIRST clause and silently
+        # dropped everything chained after it with "and" — walk the rest
+        # of the message collecting each further clause instead.
+        filters.extend(_consume_chained_clauses(text[m.end():]))
 
     m = re.search(r"\b(?:with|having)\s+(?P<col>[a-z_]+)\s*(?:=|\bis\b|\bare\b)\s*(?P<val>[a-z0-9_.'\s-]+?)\s*(?:and|,|$)", text)
     if m:
         filters.append((m.group("col"), "=", m.group("val").strip()))
+        # Same "and"-chaining gap as the "where" clause above ("with A = B
+        # and C = D") — the leading "with"/"having" is only stated once.
+        filters.extend(_consume_chained_clauses(text[m.end():]))
+    elif metadata:
+        # Implicit equality with no operator word at all ("with status
+        # active", "having department sales") — a common, natural way to
+        # phrase a simple equality filter that the explicit "=/is/are"
+        # pattern just above requires and this doesn't have. Only attempted
+        # as a fallback (the pattern above already succeeding means this is
+        # skipped) and only accepted when the first word actually grounds
+        # to a real column on the resolved table — without that check this
+        # is indistinguishable from a descriptive phrase that isn't a
+        # filter at all ("with high salary": "high" is not a column, and
+        # blindly accepting it would fabricate a nonsense filter instead of
+        # correctly leaving the request unfiltered).
+        m = re.search(r"\b(?:with|having)\s+(?P<col>[a-z_]+)\s+(?P<val>[a-z_]+)\b", text)
+        if m:
+            col_raw = m.group("col")
+            val = m.group("val")
+            # A comparative clause on this same column ("with salary
+            # greater than 50000", "with salary at least 50000") is already
+            # captured by the numeric-comparison scan above — that "val"
+            # here is a comparison word (greater/at/between/...), not a
+            # literal equality value, and this column already has its real
+            # filter in `filters`. Both checks guard the same collision:
+            # the word-list catches it even for a column this pass hasn't
+            # otherwise touched yet (scan order isn't guaranteed to have
+            # already produced an entry for every such case).
+            already_filtered = any(f[0] == col_raw for f in filters)
+            comparison_word = val in (
+                "greater", "less", "more", "fewer", "over", "under", "above",
+                "below", "exceeds", "at", "least", "most", "than", "between",
+                "equal", "equals",
+            )
+            if not already_filtered and not comparison_word:
+                grounded = G.ground_column(col_raw, metadata, table=table, allow_fresh=False)
+                if grounded and not G.is_non_entity(val) and not G.is_type_word(val):
+                    filters.append((grounded, "=", val))
 
     return filters
 
@@ -631,30 +946,49 @@ def _parse_comparative_filters(message: str, table: Optional[str],
     hardcoded word->column map. Returns (filters, ambiguous).
     """
     text = message.lower()
+    filters: List[Tuple[str, str, str]] = []
+    any_ambiguous = False
+    # Every pattern type is scanned with finditer, and EVERY type is
+    # checked (not just the first one that matches anywhere) — this used
+    # to `return` as soon as the first matching pattern TYPE was found, so
+    # a message combining two different comparative constructs ("salary at
+    # least 50000 and age at most 60" — "at least" and "at most" are two
+    # separate _COMPARATIVE_OPS entries) only ever kept the first one and
+    # silently dropped the second.
     for op_re, op, implicit_word in _COMPARATIVE_OPS:
-        m = op_re.search(text)
-        if not m:
-            continue
-        after = text[m.end():].strip()
-        val_m = re.search(r"\d+", after)
-        if not val_m:
-            continue
-        value = val_m.group(0)
-        if implicit_word:
-            head_word = implicit_word
-        else:
-            before = text[:m.start()].strip()
-            head_tokens = re.findall(r"[a-z_][a-z0-9_]*", before)
-            head_word = head_tokens[-1] if head_tokens else None
-        if not head_word or G.is_non_entity(head_word):
-            continue
-        col, ambiguous = G.resolve_attribute_word(head_word, table, metadata)
-        if col:
-            return [(col, op, value)], False
-        if ambiguous:
-            return [], True
-        return [], False
-    return [], False
+        for m in op_re.finditer(text):
+            after = text[m.end():].strip()
+            val_m = re.search(r"\d+", after)
+            if not val_m:
+                continue
+            value = val_m.group(0)
+            if implicit_word:
+                head_word = implicit_word
+            else:
+                before = text[:m.start()].strip()
+                head_tokens = re.findall(r"[a-z_][a-z0-9_]*", before)
+                # The token immediately before the comparative phrase is often
+                # a grammar word, not the attribute ("age IS over 30" — the
+                # token right before "over" is "is", not "age").
+                # is_identifier() already excludes exactly this class of word
+                # (see _STOPWORDS), so walk backward to the nearest real
+                # content word instead of blindly taking the last token —
+                # otherwise "is"/"are"/"was" etc. gets treated as the
+                # attribute, fails to resolve against any real column, and
+                # incorrectly reports the request as ambiguous even when a
+                # real column (e.g. "age") is right there.
+                head_word = next(
+                    (t for t in reversed(head_tokens) if G.is_identifier(t) and not G.is_non_entity(t)),
+                    None,
+                )
+            if not head_word or G.is_non_entity(head_word):
+                continue
+            col, ambiguous = G.resolve_attribute_word(head_word, table, metadata)
+            if col:
+                filters.append((col, op, value))
+            elif ambiguous:
+                any_ambiguous = True
+    return filters, (any_ambiguous and not filters)
 
 
 def _filter_reference_words(message: str) -> set:
@@ -726,6 +1060,29 @@ def _parse_retrieve(tokens: List[str], message: str, metadata: dict,
             if val is not None:
                 roles["limit"] = val
 
+    # "top N ... by X" implies ranking, not just capping row count — "top 5
+    # employees by salary" means the 5 HIGHEST salaries, not 5 arbitrary
+    # rows. Previously only the "5" (limit) half was extracted; "by salary"
+    # was silently dropped — no ordering clause fires for it anywhere else
+    # (the literal "order by"/"sorted by" patterns further below don't
+    # match a bare "by salary", and the superlative-word detector
+    # deliberately excludes "top N" from being treated as a superlative
+    # trigger, since a bare number after "top" is a row-count limiter, not
+    # an attribute word). Scoped to "top" specifically (the clearest "these
+    # rows are ranked by something" signal) and only when nothing else
+    # already produced ordering/aggregations, so this can't collide with
+    # the "top <dimension> by <measure>" grouped-superlative phrasing
+    # handled separately in the grouping safety net below.
+    if roles["limit"] is not None and not roles["ordering"] and not roles["aggregations"] \
+            and re.search(r"\btop\s+\d", message.lower()):
+        m = re.search(r"\bby\s+([a-z_]+)\b", message.lower())
+        if m:
+            grounded = G.ground_column(
+                m.group(1), metadata, table=roles["table"] or context_table_hint, allow_fresh=False
+            )
+            if grounded:
+                roles["ordering"].append(QueryOrdering(column=grounded, direction="DESC"))
+
     m = re.search(r"\b(?:group\s+by|grouped\s+by)\s+([a-z_]+)", message.lower())
     if m:
         roles["group_by"].append(m.group(1))
@@ -734,11 +1091,53 @@ def _parse_retrieve(tokens: List[str], message: str, metadata: dict,
         if m:
             roles["group_by"].append(m.group(1))
 
-    m = re.search(r"\b(avg|average|mean|sum|total|count|min|max)\s+(?:of\s+)?([a-z_]+)\b", message.lower())
-    if m:
-        fn_map = {"avg": "AVG", "average": "AVG", "mean": "AVG", "sum": "SUM",
-                  "total": "SUM", "count": "COUNT", "min": "MIN", "max": "MAX"}
-        roles["aggregations"].append(QueryAggregation(function=fn_map[m.group(1)], column=m.group(2)))
+    # finditer, not search — a message can name more than one aggregation
+    # ("total salary and average bonus by department"); search() only ever
+    # found the first and silently dropped every aggregation mentioned
+    # after it. deterministic_sql_builder.py already loops over
+    # query_intent.aggregations to build the SELECT clause, so widening
+    # this to multiple matches needed no downstream change.
+    fn_map = {"avg": "AVG", "average": "AVG", "mean": "AVG", "sum": "SUM",
+              "total": "SUM", "count": "COUNT", "min": "MIN", "max": "MAX"}
+    seen_aggs = set()
+    for m in re.finditer(r"\b(avg|average|mean|sum|total|count|min|max)\s+(?:of\s+)?([a-z_]+)\b", message.lower()):
+        fn = fn_map[m.group(1)]
+        col = m.group(2)
+        if (fn, col) in seen_aggs:
+            continue
+        seen_aggs.add((fn, col))
+        roles["aggregations"].append(QueryAggregation(function=fn, column=col))
+
+    # Plain "<aggregation word> ... by <column>" ("average salary by
+    # department") — the natural, common way people phrase this — did not
+    # match either "group by X" or "grouped by X"/"trends by X" above, and
+    # was previously silently dropped, producing a company-wide average
+    # instead of the per-department breakdown that was actually asked for.
+    # Only applies once an aggregation was found and no grouping was
+    # already set; excludes "order by"/"sorted by"/"sort on ... by" so this
+    # never misreads a sort instruction as a grouping instruction.
+    if roles["aggregations"] and not roles["group_by"]:
+        m = re.search(
+            r"(?<!order )(?<!sorted )(?<!sort on )\bby\s+([a-z_]+)\b",
+            message.lower(),
+        )
+        # A phrasing like "top department by total sales" has its OWN "by"
+        # clause meaning something different ("ranked by this measure", not
+        # "grouped by this dimension") — the aggregation regex above already
+        # consumed "total sales" as SUM(sales), and this safety-net regex,
+        # scanning the same text independently, would otherwise grab the
+        # word "total" right back out of that same phrase and misreport it
+        # as a grouping column. "total" is never a real dimension name (it's
+        # the aggregation-function vocabulary itself), so excluding the
+        # fn_map keys here stops that specific collision — it doesn't teach
+        # the parser "top X by Y" (a real, separate, still-unsupported
+        # phrasing), it just stops the misfire from masquerading as a
+        # correct result instead of correctly falling through to the AI
+        # Planner (deterministic_sql_builder.py's own "by X" safety net only
+        # catches this when group_by does NOT already contain a matching,
+        # if wrong, value — see is_deterministically_executable()).
+        if m and m.group(1) not in fn_map:
+            roles["group_by"].append(m.group(1))
 
     m = re.search(r"\b(?:show|give|get)\s+me\s+([a-z0-9_,\s]+?)\s+(?:of|from)\s+", message.lower())
     if m:
@@ -764,7 +1163,7 @@ def _parse_retrieve(tokens: List[str], message: str, metadata: dict,
             if col:
                 roles["ordering"].append(QueryOrdering(column=col, direction=direction))
 
-    roles["filters"] = _parse_filters(message)
+    roles["filters"] = _parse_filters(message, roles["table"] or context_table_hint, metadata)
 
     # When this message doesn't name its own table, resolve filter/superlative
     # attribute words against the prior turn's table (context_table_hint) —
@@ -885,7 +1284,13 @@ def interpret_message(message: str, metadata: dict, context: dict = None) -> Fra
     action_word, object_type = action
     prior = context.get("prior_frames") or []
     context_table_hint = prior[-1].table if prior else None
-    frame = _build_frame(action_word, object_type, tokens, msg, metadata, context_table_hint)
+    # For a chart follow-up that only changes the chart TYPE ("now show it
+    # as a pie chart") without repeating the measure/dimension, the
+    # previous turn's chart spec is what fills those back in — see the
+    # cap.id == "visualize" branch in _build_frame.
+    context_prior_chart = prior[-1].chart if prior and prior[-1].chart else None
+    frame = _build_frame(action_word, object_type, tokens, msg, metadata, context_table_hint,
+                         context_prior_chart=context_prior_chart)
     if frame is None:
         frame = SemanticFrame(action="none", capability_id="understanding_failed",
                               source="SEMANTIC_FRAME")
@@ -961,7 +1366,8 @@ def _fragment_for_pending(tokens: List[str], message: str,
 
 def _build_frame(action_word: str, object_type: Optional[str], tokens: List[str],
                  message: str, metadata: dict,
-                 context_table_hint: Optional[str] = None) -> Optional[SemanticFrame]:
+                 context_table_hint: Optional[str] = None,
+                 context_prior_chart: Optional[ChartSpec] = None) -> Optional[SemanticFrame]:
     cap = capability_for(action_word, object_type)
     if cap is None:
         return None
@@ -977,7 +1383,7 @@ def _build_frame(action_word: str, object_type: Optional[str], tokens: List[str]
         frame.table = table_name
         frame.columns = cols
     elif cap.id in ("add_column", "drop_column", "alter_column"):
-        table, column, column_type, op = _parse_alter_column(tokens, message)
+        table, column, column_type, op = _parse_alter_column(tokens, message, context_table_hint)
         frame.table = table
         frame.alter = AlterSpec(operation=op, column=column, new_type=column_type)
         if op == "DROP_COLUMN":
@@ -987,11 +1393,33 @@ def _build_frame(action_word: str, object_type: Optional[str], tokens: List[str]
         else:
             frame.capability_id = "add_column"
     elif cap.id == "add_sample_data":
-        count, table = _parse_add_sample_data(tokens, message)
+        count, table = _parse_add_sample_data(tokens, message, context_table_hint)
         frame.table = table
         frame.sample_data = SampleDataSpec(count=count, table=table)
     elif cap.id == "visualize":
-        frame.chart, frame.table = _parse_visualize(tokens, message, metadata, context_table_hint)
+        frame.chart, frame.table, chart_unresolved = _parse_visualize(
+            tokens, message, metadata, context_table_hint
+        )
+        # A chart follow-up that only changes ONE thing ("now show it as a
+        # pie chart") doesn't repeat the measure/dimension it already gave
+        # — a person wouldn't re-state "salary by department" just to
+        # switch chart types. Without this, the new chart silently had no
+        # measure or dimension at all (chart_unresolved doesn't catch it
+        # either, since no measure WORD was mentioned to fail grounding —
+        # this is a different gap: nothing being mentioned, not something
+        # unresolved). Only fills in whatever the current message left
+        # blank; anything the user did specify this turn wins.
+        if context_prior_chart:
+            if frame.chart.measure is None and context_prior_chart.measure:
+                frame.chart.measure = context_prior_chart.measure
+            if frame.chart.dimension is None and context_prior_chart.dimension:
+                frame.chart.dimension = context_prior_chart.dimension
+            if frame.chart.chart_type is None and context_prior_chart.chart_type:
+                frame.chart.chart_type = context_prior_chart.chart_type
+            if frame.chart.aggregation is None and context_prior_chart.aggregation:
+                frame.chart.aggregation = context_prior_chart.aggregation
+        if chart_unresolved:
+            frame.missing_required = list(frame.missing_required or []) + ["measure"]
     elif cap.id == "switch_database":
         frame.database = _after_marker(tokens, ("database", "db"))
         if frame.database is None:
@@ -1098,11 +1526,27 @@ def _ground_frame(frame: SemanticFrame, metadata: dict,
 
     if frame.filters:
         kept = []
+        seen_grounded: set = set()
         for f in frame.filters:
             col = f.column
             grounded_col = G.ground_column(col, metadata, table=frame.table, allow_fresh=False)
             if grounded_col:
                 f.column = grounded_col
+                # Two independent parsing passes (_parse_filters and
+                # _parse_comparative_filters) can each catch the SAME
+                # clause when a filter word has a typo — one keeps the raw
+                # typo'd spelling, the other resolves it correctly — so
+                # they look like different filters (different raw column
+                # strings) to the earlier dedup pass in _build_frame,
+                # which runs BEFORE grounding. Once both are grounded to
+                # the same real column here, they really are duplicates;
+                # re-check now that grounding has normalized them, or the
+                # generated SQL ends up with the same condition twice
+                # ("WHERE salary > 50000 AND salary > 50000").
+                key = (grounded_col, f.operator, str(f.value))
+                if key in seen_grounded:
+                    continue
+                seen_grounded.add(key)
                 kept.append(f)
             else:
                 hint = (f"The column '{col}' does not exist in table '{frame.table}'. "
